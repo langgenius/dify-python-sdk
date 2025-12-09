@@ -1,0 +1,50 @@
+name: Quick Check
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  quick-check:
+    name: Quick Check
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: "3.11"
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v3
+      with:
+        enable-cache: true
+        cache-dependency-glob: "pyproject.toml"
+
+    - name: Install dependencies
+      run: |
+        uv sync --dev
+
+    - name: Quick syntax check
+      run: |
+        find dify_client tests -name "*.py" -exec uv run python -m py_compile {} \;
+
+    - name: Check import sorting
+      run: |
+        uv run isort --check-only dify_client tests
+
+    - name: Run quick tests
+      run: |
+        uv run pytest tests/ -x --tb=short
+
+    - name: Basic import test
+      run: |
+        uv run python -c "
+        import dify_client
+        from dify_client import CompletionClient, ChatClient, AsyncCompletionClient, AsyncChatClient
+        print('All imports successful')
+        "
