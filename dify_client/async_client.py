@@ -879,6 +879,45 @@ class AsyncKnowledgeBaseClient(AsyncDifyClient):
         url = f"/datasets/{self._get_dataset_id()}/documents"
         return await self._send_request("GET", url, params=params, **kwargs)
 
+    async def get_document(self, document_id: str, metadata: str = "all"):
+        """Get detailed information about a specific document.
+
+        Args:
+            document_id: Document ID
+            metadata: Metadata inclusion mode ('all', 'only', 'without')
+
+        Returns:
+            httpx.Response object
+        """
+        params = {"metadata": metadata}
+        url = f"/datasets/{self._get_dataset_id()}/documents/{document_id}"
+        return await self._send_request("GET", url, params=params)
+
+    async def download_document(self, document_id: str):
+        """Download a specific document.
+
+        Args:
+            document_id: Document ID
+
+        Returns:
+            httpx.Response object with the file download URL
+        """
+        url = f"/datasets/{self._get_dataset_id()}/documents/{document_id}/download"
+        return await self._send_request("GET", url)
+
+    async def get_document_segment(self, document_id: str, segment_id: str):
+        """Get detailed information about a specific segment.
+
+        Args:
+            document_id: Document ID
+            segment_id: Segment ID
+
+        Returns:
+            httpx.Response object
+        """
+        url = f"/datasets/{self._get_dataset_id()}/documents/{document_id}/segments/{segment_id}"
+        return await self._send_request("GET", url)
+
     async def add_segments(self, document_id: str, segments: list[dict], **kwargs):
         """Add segments to a document."""
         data = {"segments": segments}
@@ -927,6 +966,34 @@ class AsyncKnowledgeBaseClient(AsyncDifyClient):
         return await self._send_request("POST", url, json=data, **kwargs)
 
     # Advanced Knowledge Base APIs
+    async def retrieve(
+        self,
+        query: str,
+        retrieval_model: Dict[str, Any] = None,
+        external_retrieval_model: Dict[str, Any] = None,
+        attachment_ids: List[str] = None,
+    ):
+        """Retrieve chunks from the knowledge base.
+
+        Args:
+            query: Search query text
+            retrieval_model: Retrieval model configuration (optional)
+            external_retrieval_model: External retrieval model configuration (optional)
+            attachment_ids: List of attachment IDs to include in retrieval context (optional)
+
+        Returns:
+            httpx.Response object
+        """
+        data = {"query": query}
+        if retrieval_model:
+            data["retrieval_model"] = retrieval_model
+        if external_retrieval_model:
+            data["external_retrieval_model"] = external_retrieval_model
+        if attachment_ids:
+            data["attachment_ids"] = attachment_ids
+        url = f"/datasets/{self._get_dataset_id()}/retrieve"
+        return await self._send_request("POST", url, json=data)
+
     async def hit_testing(
         self,
         query: str,
