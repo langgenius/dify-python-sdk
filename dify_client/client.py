@@ -255,6 +255,32 @@ class DifyClient(BaseClientMixin):
         """Get file preview by file ID."""
         return self._send_request("GET", f"/files/{file_id}/preview")
 
+    def get_app_feedbacks(self, page: int = 1, limit: int = 20):
+        """Get message feedbacks for the application.
+
+        Args:
+            page: Page number (default: 1)
+            limit: Number of items per page (default: 20)
+
+        Returns:
+            httpx.Response object
+        """
+        self._validate_params(page=page, limit=limit)
+        params = {"page": page, "limit": limit}
+        return self._send_request("GET", "/app/feedbacks", params=params)
+
+    def get_end_user_info(self, end_user_id: str):
+        """Get end user information.
+
+        Args:
+            end_user_id: End user ID
+
+        Returns:
+            httpx.Response object
+        """
+        self._validate_params(end_user_id=end_user_id)
+        return self._send_request("GET", f"/end-users/{end_user_id}")
+
     # App Configuration APIs
     def get_app_site_config(self, app_id: str):
         """Get app site configuration.
@@ -352,6 +378,20 @@ class CompletionClient(DifyClient):
             data,
             stream=(response_mode == "streaming"),
         )
+
+    def stop_completion_message(self, task_id: str, user: str):
+        """Stop a running completion message generation.
+
+        Args:
+            task_id: Task ID from the completion message response
+            user: User identifier (must match the one used in the original request)
+
+        Returns:
+            httpx.Response object
+        """
+        self._validate_params(task_id=task_id, user=user)
+        data = {"user": user}
+        return self._send_request("POST", f"/completion-messages/{task_id}/stop", data)
 
 
 class ChatClient(DifyClient):

@@ -178,6 +178,30 @@ class AsyncDifyClient:
         """Get file preview by file ID."""
         return await self._send_request("GET", f"/files/{file_id}/preview")
 
+    async def get_app_feedbacks(self, page: int = 1, limit: int = 20):
+        """Get message feedbacks for the application.
+
+        Args:
+            page: Page number (default: 1)
+            limit: Number of items per page (default: 20)
+
+        Returns:
+            httpx.Response object
+        """
+        params = {"page": page, "limit": limit}
+        return await self._send_request("GET", "/app/feedbacks", params=params)
+
+    async def get_end_user_info(self, end_user_id: str):
+        """Get end user information.
+
+        Args:
+            end_user_id: End user ID
+
+        Returns:
+            httpx.Response object
+        """
+        return await self._send_request("GET", f"/end-users/{end_user_id}")
+
     # App Configuration APIs
     async def get_app_site_config(self, app_id: str):
         """Get app site configuration.
@@ -280,6 +304,19 @@ class AsyncCompletionClient(AsyncDifyClient):
             data,
             stream=(response_mode == "streaming"),
         )
+
+    async def stop_completion_message(self, task_id: str, user: str):
+        """Stop a running completion message generation.
+
+        Args:
+            task_id: Task ID from the completion message response
+            user: User identifier (must match the one used in the original request)
+
+        Returns:
+            httpx.Response object
+        """
+        data = {"user": user}
+        return await self._send_request("POST", f"/completion-messages/{task_id}/stop", data)
 
 
 class AsyncChatClient(AsyncDifyClient):
