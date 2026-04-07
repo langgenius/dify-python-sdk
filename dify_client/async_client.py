@@ -178,6 +178,30 @@ class AsyncDifyClient:
         """Get file preview by file ID."""
         return await self._send_request("GET", f"/files/{file_id}/preview")
 
+    async def get_app_feedbacks(self, page: int = 1, limit: int = 20):
+        """Get message feedbacks for the application.
+
+        Args:
+            page: Page number (default: 1)
+            limit: Number of items per page (default: 20)
+
+        Returns:
+            httpx.Response object
+        """
+        params = {"page": page, "limit": limit}
+        return await self._send_request("GET", "/app/feedbacks", params=params)
+
+    async def get_end_user_info(self, end_user_id: str):
+        """Get end user information.
+
+        Args:
+            end_user_id: End user ID
+
+        Returns:
+            httpx.Response object
+        """
+        return await self._send_request("GET", f"/end-users/{end_user_id}")
+
     # App Configuration APIs
     async def get_app_site_config(self, app_id: str):
         """Get app site configuration.
@@ -280,6 +304,19 @@ class AsyncCompletionClient(AsyncDifyClient):
             data,
             stream=(response_mode == "streaming"),
         )
+
+    async def stop_completion_message(self, task_id: str, user: str):
+        """Stop a running completion message generation.
+
+        Args:
+            task_id: Task ID from the completion message response
+            user: User identifier (must match the one used in the original request)
+
+        Returns:
+            httpx.Response object
+        """
+        data = {"user": user}
+        return await self._send_request("POST", f"/completion-messages/{task_id}/stop", data)
 
 
 class AsyncChatClient(AsyncDifyClient):
@@ -842,6 +879,45 @@ class AsyncKnowledgeBaseClient(AsyncDifyClient):
         url = f"/datasets/{self._get_dataset_id()}/documents"
         return await self._send_request("GET", url, params=params, **kwargs)
 
+    async def get_document(self, document_id: str, metadata: str = "all"):
+        """Get detailed information about a specific document.
+
+        Args:
+            document_id: Document ID
+            metadata: Metadata inclusion mode ('all', 'only', 'without')
+
+        Returns:
+            httpx.Response object
+        """
+        params = {"metadata": metadata}
+        url = f"/datasets/{self._get_dataset_id()}/documents/{document_id}"
+        return await self._send_request("GET", url, params=params)
+
+    async def download_document(self, document_id: str):
+        """Download a specific document.
+
+        Args:
+            document_id: Document ID
+
+        Returns:
+            httpx.Response object with the file download URL
+        """
+        url = f"/datasets/{self._get_dataset_id()}/documents/{document_id}/download"
+        return await self._send_request("GET", url)
+
+    async def get_document_segment(self, document_id: str, segment_id: str):
+        """Get detailed information about a specific segment.
+
+        Args:
+            document_id: Document ID
+            segment_id: Segment ID
+
+        Returns:
+            httpx.Response object
+        """
+        url = f"/datasets/{self._get_dataset_id()}/documents/{document_id}/segments/{segment_id}"
+        return await self._send_request("GET", url)
+
     async def add_segments(self, document_id: str, segments: list[dict], **kwargs):
         """Add segments to a document."""
         data = {"segments": segments}
@@ -890,6 +966,34 @@ class AsyncKnowledgeBaseClient(AsyncDifyClient):
         return await self._send_request("POST", url, json=data, **kwargs)
 
     # Advanced Knowledge Base APIs
+    async def retrieve(
+        self,
+        query: str,
+        retrieval_model: Dict[str, Any] = None,
+        external_retrieval_model: Dict[str, Any] = None,
+        attachment_ids: List[str] = None,
+    ):
+        """Retrieve chunks from the knowledge base.
+
+        Args:
+            query: Search query text
+            retrieval_model: Retrieval model configuration (optional)
+            external_retrieval_model: External retrieval model configuration (optional)
+            attachment_ids: List of attachment IDs to include in retrieval context (optional)
+
+        Returns:
+            httpx.Response object
+        """
+        data = {"query": query}
+        if retrieval_model:
+            data["retrieval_model"] = retrieval_model
+        if external_retrieval_model:
+            data["external_retrieval_model"] = external_retrieval_model
+        if attachment_ids:
+            data["attachment_ids"] = attachment_ids
+        url = f"/datasets/{self._get_dataset_id()}/retrieve"
+        return await self._send_request("POST", url, json=data)
+
     async def hit_testing(
         self,
         query: str,

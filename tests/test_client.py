@@ -251,6 +251,75 @@ class TestKnowledgeBaseClient(unittest.TestCase):
         response = client.delete_dataset()
         self.assertEqual(204, response.status_code)
 
+    @patch("dify_client.client.httpx.Client")
+    def test_retrieve(self, mock_httpx_client):
+        # Mock the HTTP response
+        mock_response = Mock()
+        mock_response.text = '{"data": [{"id": "segment1", "content": "test content"}]}\n'
+        mock_response.json.return_value = {"data": [{"id": "segment1", "content": "test content"}]}
+        mock_response.status_code = 200
+
+        mock_client_instance = Mock()
+        mock_client_instance.request.return_value = mock_response
+        mock_httpx_client.return_value = mock_client_instance
+
+        # Create client with mocked httpx
+        knowledge_base_client = KnowledgeBaseClient(self.api_key, base_url=self.base_url, dataset_id=self.dataset_id)
+        response = knowledge_base_client.retrieve("test query", "test_user")
+        self.assertIn("data", response.text)
+
+    @patch("dify_client.client.httpx.Client")
+    def test_get_document(self, mock_httpx_client):
+        # Mock the HTTP response
+        mock_response = Mock()
+        mock_response.text = '{"id": "doc1", "name": "Test Document"}'
+        mock_response.json.return_value = {"id": "doc1", "name": "Test Document"}
+        mock_response.status_code = 200
+
+        mock_client_instance = Mock()
+        mock_client_instance.request.return_value = mock_response
+        mock_httpx_client.return_value = mock_client_instance
+
+        # Create client with mocked httpx
+        knowledge_base_client = KnowledgeBaseClient(self.api_key, base_url=self.base_url, dataset_id=self.dataset_id)
+        response = knowledge_base_client.get_document(self.document_id)
+        self.assertIn("id", response.text)
+        self.assertIn("name", response.text)
+
+    @patch("dify_client.client.httpx.Client")
+    def test_download_document(self, mock_httpx_client):
+        # Mock the HTTP response
+        mock_response = Mock()
+        mock_response.content = b"test document content"
+        mock_response.status_code = 200
+
+        mock_client_instance = Mock()
+        mock_client_instance.request.return_value = mock_response
+        mock_httpx_client.return_value = mock_client_instance
+
+        # Create client with mocked httpx
+        knowledge_base_client = KnowledgeBaseClient(self.api_key, base_url=self.base_url, dataset_id=self.dataset_id)
+        response = knowledge_base_client.download_document(self.document_id)
+        self.assertEqual(200, response.status_code)
+
+    @patch("dify_client.client.httpx.Client")
+    def test_get_document_segment(self, mock_httpx_client):
+        # Mock the HTTP response
+        mock_response = Mock()
+        mock_response.text = '{"id": "segment1", "content": "test segment content"}'
+        mock_response.json.return_value = {"id": "segment1", "content": "test segment content"}
+        mock_response.status_code = 200
+
+        mock_client_instance = Mock()
+        mock_client_instance.request.return_value = mock_response
+        mock_httpx_client.return_value = mock_client_instance
+
+        # Create client with mocked httpx
+        knowledge_base_client = KnowledgeBaseClient(self.api_key, base_url=self.base_url, dataset_id=self.dataset_id)
+        response = knowledge_base_client.get_document_segment(self.document_id, self.segment_id)
+        self.assertIn("id", response.text)
+        self.assertIn("content", response.text)
+
 
 class TestChatClient(unittest.TestCase):
     @patch("dify_client.client.httpx.Client")
@@ -489,6 +558,24 @@ class TestCompletionClient(unittest.TestCase):
         )
         self.assertIn("answer", response.text)
 
+    @patch("dify_client.client.httpx.Client")
+    def test_stop_completion_message(self, mock_httpx_client):
+        # Mock the HTTP response
+        mock_response = Mock()
+        mock_response.text = '{"result": "success"}'
+        mock_response.json.return_value = {"result": "success"}
+        mock_response.status_code = 200
+
+        mock_client_instance = Mock()
+        mock_client_instance.request.return_value = mock_response
+        mock_httpx_client.return_value = mock_client_instance
+
+        # Create client with mocked httpx
+        completion_client = CompletionClient(self.api_key)
+        response = completion_client.stop_completion_message("test-task-id", "test_user")
+        self.assertIn("result", response.text)
+        self.assertEqual("success", response.json()["result"])
+
 
 class TestDifyClient(unittest.TestCase):
     @patch("dify_client.client.httpx.Client")
@@ -567,6 +654,42 @@ class TestDifyClient(unittest.TestCase):
             files = {"file": (file_name, file, mime_type)}
             response = dify_client.file_upload("test_user", files)
             self.assertIn("name", response.text)
+
+    @patch("dify_client.client.httpx.Client")
+    def test_get_app_feedbacks(self, mock_httpx_client):
+        # Mock the HTTP response
+        mock_response = Mock()
+        mock_response.text = '{"data": [{"id": "feedback1", "rating": "like"}], "total": 1}'
+        mock_response.json.return_value = {"data": [{"id": "feedback1", "rating": "like"}], "total": 1}
+        mock_response.status_code = 200
+
+        mock_client_instance = Mock()
+        mock_client_instance.request.return_value = mock_response
+        mock_httpx_client.return_value = mock_client_instance
+
+        # Create client with mocked httpx
+        dify_client = DifyClient(self.api_key)
+        response = dify_client.get_app_feedbacks(page=1, limit=10)
+        self.assertIn("data", response.text)
+        self.assertIn("total", response.text)
+
+    @patch("dify_client.client.httpx.Client")
+    def test_get_end_user_info(self, mock_httpx_client):
+        # Mock the HTTP response
+        mock_response = Mock()
+        mock_response.text = '{"id": "user1", "name": "Test User"}'
+        mock_response.json.return_value = {"id": "user1", "name": "Test User"}
+        mock_response.status_code = 200
+
+        mock_client_instance = Mock()
+        mock_client_instance.request.return_value = mock_response
+        mock_httpx_client.return_value = mock_client_instance
+
+        # Create client with mocked httpx
+        dify_client = DifyClient(self.api_key)
+        response = dify_client.get_end_user_info("test_user")
+        self.assertIn("id", response.text)
+        self.assertIn("name", response.text)
 
 
 if __name__ == "__main__":
