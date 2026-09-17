@@ -206,3 +206,8 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 .idea
+
+# Provider credentials and plugin cache for local runs against real models
+# (Workflow.run(credentials=...)). Never committed.
+credentials.json
+.slim/

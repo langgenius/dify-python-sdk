@@ -26,8 +26,11 @@ jobs:
         cache-dependency-glob: "pyproject.toml"
 
     - name: Install dependencies
+      # With the `workflow` extra: this job collects the whole suite, and
+      # `tests/test_workflow.py` imports `dify_client.workflow`, which needs
+      # graphon. Without it the run fails at collection rather than at a test.
       run: |
-        uv sync --dev
+        uv sync --dev --extra workflow
 
     - name: Quick syntax check
       run: |
@@ -39,12 +42,15 @@ jobs:
 
     - name: Run quick tests
       run: |
-        uv run pytest tests/ -x --tb=short
+        uv run pytest tests/ -x --tb=short -m "not live"
 
-    - name: Basic import test
+    - name: Every exported name resolves
+      # This used to import specific classes by hand, and went on naming ones
+      # that had been deleted. Checking __all__ cannot go stale that way.
       run: |
         uv run python -c "
         import dify_client
-        from dify_client import CompletionClient, ChatClient, AsyncCompletionClient, AsyncChatClient
-        print('All imports successful')
+        missing = [n for n in dify_client.__all__ if not hasattr(dify_client, n)]
+        assert not missing, missing
+        print(f'{len(dify_client.__all__)} exported names, all resolvable')
         "
