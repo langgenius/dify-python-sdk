@@ -31,11 +31,14 @@ from __future__ import annotations
 import os
 import platform
 import shutil
-import subprocess
+
+# Running a program under confinement is what this module is for.
+import subprocess  # nosec B404
 import sys
 import tempfile
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Generator
 
@@ -129,6 +132,25 @@ class LocalSandbox:
         self.python = python or sys.executable
         self.confine = confine
 
+    @staticmethod
+    @lru_cache(maxsize=1)
+    def available() -> bool:
+        """Whether this host can actually confine code, tried rather than guessed.
+
+        The presence of ``bwrap`` is not the same as being allowed to use it:
+        Ubuntu 24.04 restricts unprivileged user namespaces, and a container
+        may block them outright. So this runs one trivial confined program and
+        reports what happened — which is the difference between a test that
+        skips on a host without a sandbox and one that fails on it.
+        """
+        try:
+            LocalSandbox(timeout=30.0)._run("print('{}')")
+        except (SandboxUnavailable, OSError):
+            return False
+        except Exception:  # noqa: BLE001 - anything else is also "no"
+            return False
+        return True
+
     def importable(self) -> list[str]:
         """Top-level modules a code node will be able to import, beyond stdlib."""
         return sorted(_resolve_packages(self.packages))
@@ -165,7 +187,8 @@ class LocalSandbox:
             libs = _link_packages(self.packages, Path(work) / "libs")
             command = self._command(script, Path(work))
             try:
-                completed = subprocess.run(  # noqa: S603 - the argv is built here
+                # The argv is built here, never a shell, never from input.
+                completed = subprocess.run(  # noqa: S603  # nosec B603
                     command,
                     capture_output=True,
                     text=True,
@@ -221,7 +244,9 @@ class LocalSandbox:
             ]
 
         if system == "Linux" and shutil.which("bwrap"):
-            command = [
+            # The "/tmp" below is a fresh tmpfs mounted over /tmp *inside* the
+            # sandbox — the opposite of writing to a predictable temp path.
+            command = [  # nosec B108
                 "bwrap",
                 "--ro-bind",
                 "/",

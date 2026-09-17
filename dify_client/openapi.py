@@ -44,7 +44,8 @@ if TYPE_CHECKING:
 
 #: Environment variable holding the OAuth bearer. The same one ``difyctl``
 #: reads, and here it means the same thing.
-OPENAPI_TOKEN_ENV = "DIFY_TOKEN"
+# The name of an environment variable, not a credential.
+OPENAPI_TOKEN_ENV = "DIFY_TOKEN"  # nosec B105
 
 #: Where the surface is mounted.
 OPENAPI_PATH = "/openapi/v1"

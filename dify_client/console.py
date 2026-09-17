@@ -40,7 +40,8 @@ if TYPE_CHECKING:
 #: holds a ``dfoa_`` OAuth bearer for the ``/openapi/v1`` surface — a different
 #: credential for a different API. The host variable is shared, because that
 #: one does mean the same thing in both.
-CONSOLE_TOKEN_ENV = "DIFY_CONSOLE_TOKEN"
+# The name of an environment variable, not a credential.
+CONSOLE_TOKEN_ENV = "DIFY_CONSOLE_TOKEN"  # nosec B105
 
 #: Environment variable holding the Dify host, e.g. ``https://cloud.dify.ai``.
 #: Shared with ``difyctl``, which reads the same one.

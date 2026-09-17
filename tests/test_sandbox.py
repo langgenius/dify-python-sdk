@@ -14,9 +14,12 @@ from dify_client.workflow import (
 )
 from dify_client.workflow.sandbox import _last_frames, code_executor
 
-CAN_CONFINE = platform.system() == "Darwin" or bool(shutil.which("bwrap"))
+# Tried, not guessed: `bwrap` on PATH is not the same as being allowed to use
+# it — Ubuntu 24.04 restricts unprivileged user namespaces — and a presence
+# check would turn "this host cannot confine" into a failing test.
 needs_confinement = pytest.mark.skipif(
-    not CAN_CONFINE, reason="this host offers no sandbox (needs macOS or bubblewrap)"
+    not LocalSandbox.available(),
+    reason="this host cannot confine code (needs macOS or working bubblewrap)",
 )
 
 

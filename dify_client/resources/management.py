@@ -426,7 +426,9 @@ class Apps(Resource):
             if result.imported and result.created and result.app_id:
                 try:
                     app.delete()
-                except Exception:  # noqa: BLE001 - the original failure matters
+                # A cleanup failure must not replace the failure the caller
+                # is already dealing with.
+                except Exception:  # noqa: BLE001  # nosec B110
                     pass
 
 

@@ -84,6 +84,12 @@ jobs:
 
     # The Service-API coverage tests read Dify's own controllers. Without this
     # they skip, and a skipped check proves nothing.
+    - name: Install bubblewrap
+      # Without it the code-node tests skip themselves — they need an OS
+      # sandbox, and a skipped test proves nothing.
+      run: |
+        sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap
+
     - name: Check out the Dify this SDK is verified against
       run: |
         git clone --depth 1 --branch "$(cat tests/DIFY_VERSION)" \

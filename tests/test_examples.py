@@ -126,17 +126,21 @@ class TestCodeNodeExample:
         assert result.node("stats")["words"] == 3
 
     def test_the_local_sandbox_runs_the_real_logic(self):
-        from dify_client.workflow import LocalSandbox, SandboxUnavailable
+        """Asked before running, not caught after: the engine turns a sandbox
+        that will not start into a *node failure*, so `except
+        SandboxUnavailable` here never fired and the test failed on any host
+        without bubblewrap."""
+        from dify_client.workflow import LocalSandbox
+
+        if not LocalSandbox.available():
+            pytest.skip("this host cannot confine code (needs macOS or bubblewrap)")
 
         wf = load("06_code_node.py").build()
-        try:
-            result = wf.run(
-                {"text": "the migration failed"},
-                code=LocalSandbox(),
-                raise_on_error=True,
-            )
-        except SandboxUnavailable:
-            pytest.skip("this host offers no sandbox")
+        result = wf.run(
+            {"text": "the migration failed"},
+            code=LocalSandbox(),
+            raise_on_error=True,
+        )
         assert result.node("stats")["words"] == 3
         assert result.node("stats")["longest"] == "migration"
 

@@ -32,6 +32,11 @@ jobs:
       run: |
         uv sync --dev --extra workflow
 
+    - name: Install bubblewrap
+      # The code-node tests confine what they run; without a sandbox they skip.
+      run: |
+        sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap
+
     - name: Quick syntax check
       run: |
         find dify_client tests -name "*.py" -exec uv run python -m py_compile {} \;
