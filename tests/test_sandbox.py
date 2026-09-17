@@ -57,6 +57,12 @@ class TestWithoutAnExecutor:
 
 
 class TestStubCode:
+    def test_the_program_it_runs_is_the_one_dify_would_have(self):
+        """graphon builds it, so local and remote execute the same source."""
+        stub = StubCode({"n": 1})
+        code_workflow(LENGTH, {"n": "number"}).run({"q": "hi"}, code=stub)
+        assert stub.calls[0][0] == LENGTH
+
     def test_it_answers_without_running_anything(self):
         wf = code_workflow(LENGTH, {"n": "number"})
         result = wf.run({"q": "hello"}, code=StubCode({"n": 999}))
@@ -70,17 +76,18 @@ class TestStubCode:
         assert inputs == {"q": "hello"}
 
 
+@needs_confinement
 class TestLocalSandbox:
+    """Everything here actually runs code under the OS sandbox, so it needs a
+    host that can confine one. GitHub's runners cannot: `bwrap` is installed
+    but the kernel refuses the network namespace it sets up
+    (`RTM_NEWADDR: Operation not permitted`), and `available()` finds that out
+    by trying rather than by looking for the binary."""
+
     def test_it_runs_the_node_and_returns_its_outputs(self):
         wf = code_workflow(LENGTH, {"n": "number"})
         result = wf.run({"q": "hello"}, code=LocalSandbox(), raise_on_error=True)
         assert result.node("c")["n"] == 5
-
-    def test_the_program_it_runs_is_the_one_dify_would_have(self):
-        """graphon builds it, so local and remote execute the same source."""
-        stub = StubCode({"n": 1})
-        code_workflow(LENGTH, {"n": "number"}).run({"q": "hi"}, code=stub)
-        assert stub.calls[0][0] == LENGTH
 
     def test_an_error_in_the_node_names_the_user_line(self):
         wf = code_workflow("def main(q):\n    return {'r': 1 / 0}", {"r": "string"})
@@ -162,6 +169,7 @@ class TestImportSurface:
         result = wf.run({"q": "x"}, code=sandbox, raise_on_error=True)
         return set(filter(None, result.node("c")["r"].split(",")))
 
+    @needs_confinement
     def test_the_projects_packages_are_hidden_by_default(self):
         assert self._importable(LocalSandbox()) == {"json"}
 
@@ -170,9 +178,11 @@ class TestImportSurface:
         import httpx  # noqa: F401
         import pandas  # noqa: F401
 
+    @needs_confinement
     def test_a_declared_package_becomes_importable(self):
         assert self._importable(LocalSandbox(packages=["httpx"])) == {"httpx", "json"}
 
+    @needs_confinement
     def test_declaring_one_package_does_not_open_the_rest(self):
         assert "pandas" not in self._importable(LocalSandbox(packages=["httpx"]))
 

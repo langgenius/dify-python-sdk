@@ -33,7 +33,9 @@ jobs:
         uv sync --dev --extra workflow
 
     - name: Install bubblewrap
-      # The code-node tests confine what they run; without a sandbox they skip.
+      # The code-node tests confine what they run. GitHub's runners do not
+      # allow the network namespace bubblewrap needs, so they skip here — see
+      # the same step in ci.yml.
       run: |
         sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap
 

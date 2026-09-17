@@ -85,8 +85,12 @@ jobs:
     # The Service-API coverage tests read Dify's own controllers. Without this
     # they skip, and a skipped check proves nothing.
     - name: Install bubblewrap
-      # Without it the code-node tests skip themselves — they need an OS
-      # sandbox, and a skipped test proves nothing.
+      # The code-node tests need an OS sandbox. This installs one; whether it
+      # can be used is a second question, and the tests ask it by trying:
+      # GitHub's runners refuse the network namespace bubblewrap sets up
+      # ("RTM_NEWADDR: Operation not permitted"), so today these tests skip
+      # here and run on a developer's machine. Installed anyway, so that they
+      # start running the day that changes.
       run: |
         sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap
 
