@@ -1,12 +1,16 @@
 [project]
 name = "dify-client"
-version = "0.1.12"
-description = "A package for interacting with the Dify Service-API"
+version = "1.0.0"
+description = "The Python SDK for Dify: apps, knowledge bases and workspace management"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12,<3.14"
 dependencies = [
-    "httpx[http2]>=0.27.0",
-    "aiofiles>=23.0.0",
+    # httpx without the http2 extra: nothing here asks for HTTP/2, and the
+    # extra pulls `h2` into every install that does not use it.
+    "httpx>=0.27.0",
+    # Reading and writing app definitions. The Service-API client needs it for
+    # DSL import and export.
+    "pyyaml>=6.0",
 ]
 authors = [
     {name = "Dify", email = "hello@dify.ai"}
@@ -14,33 +18,55 @@ authors = [
 license = {text = "MIT"}
 keywords = ["dify", "nlp", "ai", "language-processing"]
 classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    # The package ships py.typed; saying so is how an installer finds out.
+    "Typing :: Typed",
 ]
 
 [project.urls]
-Homepage = "https://github.com/langgenius/dify"
+Homepage = "https://github.com/langgenius/dify-python-sdk"
+Repository = "https://github.com/langgenius/dify-python-sdk"
+Changelog = "https://github.com/langgenius/dify-python-sdk/blob/main/CHANGELOG.md"
+Documentation = "https://docs.dify.ai"
+"Dify itself" = "https://github.com/langgenius/dify"
 
 [project.optional-dependencies]
-dev = [
-    "pytest>=7.0.0",
-    "pytest-asyncio>=0.21.0",
-    "pytest-cov>=4.0.0",
-    "black>=23.0.0",
-    "flake8>=6.0.0",
-    "isort>=5.12.0",
-    "mypy>=1.0.0",
-    "bandit>=1.7.0",
-    "safety>=2.0.0",
+# Building, testing and running workflows locally. The Service-API client
+# needs none of it.
+workflow = [
+    "graphon>=0.8.0",
 ]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.build.targets.sdist]
+# Named rather than inferred: hatchling otherwise sweeps in whatever is lying
+# in the working tree, and a build made on a developer's machine published
+# their stray files.
+include = [
+    "/dify_client",
+    "/tests",
+    "/examples",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE",
+    "/pyproject.toml",
+]
+
 [tool.hatch.build.targets.wheel]
 packages = ["dify_client"]
+# PEP 561: without this marker, type checkers ignore the annotations entirely
+# for anyone who installs the package.
+artifacts = ["dify_client/py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -48,10 +74,21 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 asyncio_mode = "auto"
+markers = [
+    # Tests marked billed skip themselves unless DIFY_LIVE_TESTS is set. The
+    # marker exists so a CI job can also deselect them outright with
+    # `-m "not billed"`, without depending on the environment being clean.
+    "billed: calls real models and costs money; skipped unless DIFY_LIVE_TESTS is set",
+    "slow: pulls or starts a container; deselect with -m \"not slow\"",
+    # The live harness in tests/live. It needs a running Dify and skips itself
+    # without one, so `pytest` stays green on a laptop; CI runs it as its own
+    # job with `-m live`.
+    "live: talks to a running Dify; skipped unless DIFY_HOST and console credentials are set",
+]
 
 [tool.black]
 line-length = 88
-target-version = ['py310', 'py311', 'py312', 'py314']
+target-version = ['py312', 'py313']
 include = '\.pyi?$'
 extend-exclude = '''
 /(
@@ -74,7 +111,7 @@ line_length = 88
 known_first_party = ["dify_client"]
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.12"
 warn_return_any = false
 warn_unused_configs = false
 disallow_untyped_defs = false
@@ -88,7 +125,21 @@ warn_no_return = false
 warn_unreachable = false
 strict_equality = false
 ignore_missing_imports = true
+follow_imports = "silent"
 disable_error_code = ["assignment", "var-annotated", "call-arg"]
+
+[[tool.mypy.overrides]]
+# Third-party sources mypy would otherwise parse and choke on.
+module = ["graphon.*", "yaml", "aiofiles"]
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+# The builder deliberately takes plain strings and dicts and lets pydantic
+# validate them into graphon's enums and entities, so callers never have to
+# import graphon themselves. mypy sees each of those as a type mismatch;
+# pydantic rejects a genuinely wrong value at construction time instead.
+module = ["dify_client.workflow.builder"]
+disable_error_code = ["arg-type", "misc"]
 
 [tool.coverage.run]
 source = ["dify_client"]
@@ -117,10 +168,14 @@ dev = [
     "black>=25.12.0",
     "isort>=5.12.0",
     "mypy>=1.0.0",
+    "types-PyYAML>=6.0",
     "pytest>=8.4.2",
     "pytest-asyncio>=1.2.0",
     "pytest-cov>=7.0.0",
     "ruff>=0.14.8",
     "safety>=2.0.0",
     "types-aiofiles",
+    # Used by .github/workflows/build.yml, which called them undeclared.
+    "build>=1.0.0",
+    "twine>=5.0.0",
 ]

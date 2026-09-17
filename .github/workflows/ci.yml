@@ -5,6 +5,11 @@ on:
     branches: [ main, develop ]
   pull_request:
     branches: [ main ]
+  # The live harness needs a Dify to talk to, so it is opt-in rather than
+  # on every push.
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * 1"
 
 jobs:
   lint:
@@ -12,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.14"]
+        python-version: ["3.12", "3.13"]
 
     steps:
     - uses: actions/checkout@v4
@@ -30,7 +35,7 @@ jobs:
 
     - name: Install dependencies
       run: |
-        uv sync --dev
+        uv sync --dev --extra workflow
 
     - name: Run ruff (linting)
       run: |
@@ -57,7 +62,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.14"]
+        python-version: ["3.12", "3.13"]
 
     steps:
     - uses: actions/checkout@v4
@@ -75,11 +80,28 @@ jobs:
 
     - name: Install dependencies
       run: |
-        uv sync --dev
+        uv sync --dev --extra workflow
+
+    # The Service-API coverage tests read Dify's own controllers. Without this
+    # they skip, and a skipped check proves nothing.
+    - name: Install bubblewrap
+      # The code-node tests need an OS sandbox. This installs one; whether it
+      # can be used is a second question, and the tests ask it by trying:
+      # GitHub's runners refuse the network namespace bubblewrap sets up
+      # ("RTM_NEWADDR: Operation not permitted"), so today these tests skip
+      # here and run on a developer's machine. Installed anyway, so that they
+      # start running the day that changes.
+      run: |
+        sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap
+
+    - name: Check out the Dify this SDK is verified against
+      run: |
+        git clone --depth 1 --branch "$(cat tests/DIFY_VERSION)" \
+          https://github.com/langgenius/dify.git ../dify-oss
 
     - name: Run tests with pytest
       run: |
-        uv run pytest -v --cov=dify_client --cov-report=xml --cov-report=html
+        uv run pytest -v -m "not live" --cov=dify_client --cov-report=xml --cov-report=html
 
     - name: Upload coverage to Codecov
       uses: codecov/codecov-action@v3
@@ -99,7 +121,7 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
-        python-version: "3.11"
+        python-version: "3.12"
 
     - name: Install uv
       uses: astral-sh/setup-uv@v3
@@ -109,7 +131,7 @@ jobs:
 
     - name: Install dependencies
       run: |
-        uv sync --dev
+        uv sync --dev --extra workflow
 
     - name: Run bandit security linter
       run: |
@@ -123,3 +145,35 @@ jobs:
         name: security-reports
         path: |
           bandit-report.json
+
+  live:
+    # Contract tests against a real Dify. Opt-in: it needs a server, so it runs
+    # on a schedule and on demand rather than on every push.
+    name: Live contract tests
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v4
+      with:
+        enable-cache: true
+        cache-dependency-glob: "pyproject.toml"
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    - name: Install dependencies
+      run: |
+        uv sync --dev --extra workflow
+
+    - name: Run the harness
+      env:
+        DIFY_HOST: ${{ secrets.DIFY_HOST }}
+        DIFY_CONSOLE_EMAIL: ${{ secrets.DIFY_CONSOLE_EMAIL }}
+        DIFY_CONSOLE_PASSWORD: ${{ secrets.DIFY_CONSOLE_PASSWORD }}
+      run: |
+        uv run pytest tests/live -v
