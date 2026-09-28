@@ -455,11 +455,15 @@ class Agent:
 
     # -- writing -----------------------------------------------------------
 
-    def to_dict(self, *, include_secret: bool = False) -> dict[str, Any]:
-        """Render the Agent as a Dify app DSL document.
+    def to_package(self, *, include_secret: bool = False) -> dict[str, Any]:
+        """Render the Agent as one portable package, the unit Dify imports.
 
-        Credentials in the soul are blanked unless ``include_secret`` is set,
-        so the default output is safe to write to a file and commit.
+        An Agent app's DSL carries exactly one of these; a workflow that ships
+        an inline Agent carries them under ``agent_packages``, keyed by the ref
+        its agent node binds to. Both are the same shape, which is why this is
+        a method rather than something written twice — and why the two things
+        Dify will not accept are refused here rather than in ``to_dict()``,
+        which is only one of the two ways a package reaches a server.
         """
         if not self.name:
             msg = "An agent needs a name."
@@ -471,7 +475,6 @@ class Agent:
                 "and read it with Agent.from_yaml()."
             )
             raise AgentError(msg)
-
         soul = copy.deepcopy(self.soul)
         package: dict[str, Any] = {
             "schema_version": PACKAGE_SCHEMA_VERSION,
@@ -492,6 +495,15 @@ class Agent:
             package["omitted_assets"] = list(self.omitted_assets)
         if self.workspace_skills:
             package["workspace_skills"] = list(self.workspace_skills)
+        return package
+
+    def to_dict(self, *, include_secret: bool = False) -> dict[str, Any]:
+        """Render the Agent as a Dify app DSL document.
+
+        Credentials in the soul are blanked unless ``include_secret`` is set,
+        so the default output is safe to write to a file and commit.
+        """
+        package = self.to_package(include_secret=include_secret)
 
         return {
             "app": {

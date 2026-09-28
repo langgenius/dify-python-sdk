@@ -55,7 +55,7 @@ from dify_client.exceptions import (
     ValidationError,
 )
 from dify_client.knowledge import AsyncDifyKnowledge, DifyKnowledge
-from dify_client.lifecycle import Deployment, Stage
+from dify_client.lifecycle import Deployment, PipelineDeployment, Stage
 from dify_client.openapi import OpenApiClient, Workspace
 from dify_client.resources import (
     Annotation,
@@ -82,6 +82,7 @@ from dify_client.results import (
     PageLimitReached,
     WorkflowRun,
 )
+from dify_client.search import retrieval_model, weighted_score
 from dify_client.skills import Skill, SkillError, WorkspaceSkill
 from dify_client.streams import (
     AsyncMessageStream,
@@ -122,6 +123,9 @@ __all__ = [
     "Conversation",
     "Dataset",
     "Deployment",
+    "retrieval_model",
+    "weighted_score",
+    "PipelineDeployment",
     "ManagedApp",
     "Stage",
     "Document",

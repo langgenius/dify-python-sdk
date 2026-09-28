@@ -27,11 +27,17 @@ importing them must not require `graphon`. There is a test that enforces it.
 | `results.py`, `usage.py`, `lifecycle.py` | what calls return. No `graphon` import, ever |
 | `paging.py` | turning Dify's two paging styles into one `Page` / `AsyncPage` |
 | `catalog.py` | model providers and models, shared by the Service API and the console |
+| `search.py` | how a knowledge base is searched — one retrieval block, built once for the three places that take it |
 | `version.py` | `__version__` and the User-Agent. The version is read from the installed distribution, never written down twice |
 | `sse.py` | decoding one server-sent event line. Internal; knows nothing about runs |
 | `streams.py` | `WorkflowRunStream` / `MessageStream` — a run observed, built on `sse.py` |
 | `compat.py` | capability probing |
 | `workflow/`, `agent.py`, `skills.py`, `tools.py` | defining apps in code; needs the `workflow` extra |
+| `workflow/graph.py` | the graph both documents are: nodes, edges, canvas, and every node helper that is not an end |
+| `workflow/parts.py` | what a graph is assembled from — variables, edges, containers, arguments — each carrying the one rule Dify would report late |
+| `workflow/builder.py`, `workflow/pipeline.py` | the two documents — an app (`kind: app`) and a knowledge pipeline (`kind: rag_pipeline`). Each adds its own ends, its own envelope and its own `validate()` |
+| `workflow/nodes/` | one module per node family — the schema when this SDK owns it, and in every case the rules Dify applies to that node type. A rule about retrieval modes is a fact about the knowledge node, not about documents, so it lives here and the helper delegates |
+| `workflow/local_knowledge.py` | the knowledge node run without a server: a stand-in, not a re-implementation |
 
 ## The rule that matters most
 
@@ -87,9 +93,19 @@ set -a && . ./.env && set +a     # the local instance's credentials
 uv run pytest tests/live
 ```
 
-The **billed** tests are gated separately and want a token rather than an email,
-so they skip silently without one — which is how a billed test calling a deleted
-method survived unnoticed:
+The **billed** tests spend money, so they also want `DIFY_LIVE_TESTS=1`. The
+ones under `tests/live/` ask for nothing else — the harness logs in when they
+run:
+
+```bash
+DIFY_LIVE_TESTS=1 uv run pytest tests/live -m billed
+```
+
+`tests/test_workflow_billed_example.py` is different on purpose: it is the
+sample of a *user's* billed test, written with `requires_live` and
+`DifyManagement()`, which read a console token from the environment because a
+user's test has no other way in. Without one it skips silently — which is how
+a billed test calling a deleted method survived unnoticed. To run it:
 
 ```bash
 eval $(uv run python -c "
@@ -220,8 +236,109 @@ Each of these cost real debugging time.
   needs a `query` *and* its start inputs; a workflow app runs on inputs alone at
   `/workflows/run`. The wrong route answers "check if your app mode matches".
 - **A document is not searchable when it uploads.** Wait for indexing.
-- **Trigger nodes are not in graphon**, only in Dify's own `core.workflow.nodes`,
-  so a workflow using one cannot run locally.
+- **How a knowledge base is searched is stored on the base**, not passed per
+  call, so `datasets.create(embedding=…, retrieval=…)` decides what every
+  later retrieval does — a workflow's knowledge node included. Three things
+  about that block are easy to get wrong:
+  - **A score threshold is two fields.** `score_threshold` is ignored unless
+    `score_threshold_enabled` is true, so a threshold set alone reads as a
+    filter that does nothing. `retrieval_model(score_threshold=…)` sets both,
+    and omitting it turns the flag off — those are the two states.
+  - **An `economy` base is always searched by keyword.** `dataset_retrieval`
+    overrides `search_method` when the indexing technique is economy, because
+    there are no embeddings to compare against. The setting is still stored,
+    and starts mattering if the base is switched to `high_quality`.
+  - **Reranking has two modes and only one calls a model.** Dify reads
+    `reranking_model` only when `reranking_enable` is true; `weighted_score`
+    blends the vector and keyword scores arithmetically. Setting both is not a
+    stronger rerank, it is a contradiction — `retrieval_model()` refuses it.
+  - **What `reranking_enable` means depends on where it is written.** On a
+    knowledge base's own settings, hybrid search reads the weights whatever
+    the flag says, so `retrieval_model(weights=...)` leaves it off. On a
+    workflow's knowledge node over several bases it is the switch: the merge
+    uses the weights only `if reranking_enable and dataset_count > 1`
+    (`core/rag/retrieval/dataset_retrieval.py`), and **Dify's own editor
+    writes it off**, so a weighted node built in the UI merges unweighted.
+    The node path sets it. Measured on 1.17.1 with vector 0.5 / keyword 0.5
+    and a query sharing no keyword with the chunks: flag on scored every
+    chunk at exactly half the unweighted run; flag off scored identically to
+    it. `test_billed_rerank.py` pins both.
+- **Some node types are not in graphon**, only in Dify's own
+  `core.workflow.nodes`, so a workflow using one cannot run locally:
+  `knowledge-retrieval`, `knowledge-index`, `document-extractor`,
+  `human-input`, `agent`, `datasource` and the three triggers. What *does* run
+  is `graphon.dsl.node_factory.SUPPORTED_DEFAULT_FACTORY_NODE_TYPES` — read it
+  rather than a list written down here. The knowledge node is the one with a
+  local stand-in (`knowledge=StubKnowledge([...])`), because retrieval has a
+  seam a fixture can sit in; the rest do not.
+- **Dify encrypts `dataset_ids` when it exports a workflow**, keyed by the
+  tenant, and falls back to a plain UUID when it imports one. So a knowledge
+  node built here imports fine, an export does not name the knowledge base, and
+  an export imported into *another workspace* silently loses it — the id
+  decrypts to nothing and is filtered out, leaving a knowledge node with no
+  knowledge base and no error. `app_dsl_service.decrypt_dataset_id` is the
+  fallback; `DSL_EXPORT_ENCRYPT_DATASET_ID` is the switch.
+- **The agent node is two nodes, and the second one binds two ways.** A plugin
+  *strategy* (`wf.agent(...)`) publishes even when the plugin is missing,
+  because Dify resolves the strategy at run time — publishing is not the check
+  it looks like. A *Dify Agent* (version `2`) names an Agent through
+  `agent_binding`, and Dify writes the binding record while importing the
+  draft: `roster_agent` + `agent_id` points at a published workspace Agent
+  (`wf.dify_agent`), and `inline_agent` + `package_ref` ships the Agent inside
+  the document under `agent_packages`, which Dify materializes as an Agent
+  owned by that node (`wf.inline_agent`). Three failures, and they land in
+  three different places: an unpublished roster Agent fails the **import**, an
+  empty `agent_binding` fails the **import**, and a binding naming a kind but
+  no id is skipped on import and fails the **publish** with "requires a
+  binding before publishing". The job config also moves: a roster node carries
+  `agent_task` / `agent_declared_outputs`, a packaged one carries the same two
+  inside `agent_job`.
+- **`datasource` and `knowledge-index` are pipeline nodes an app will take.**
+  They belong to `kind: rag_pipeline`, but an app workflow carrying one
+  imports and publishes — checked against 1.17.1 rather than assumed from
+  where they live.
+- **A pipeline drops what its importer does not know, and publishes anyway.**
+  An agent node bound to an inline package imports, publishes, and comes back
+  exported with `agent_packages: []` — the binding still names a package that
+  is no longer there, and nothing fails until the run. `rag_pipeline_dsl_service`
+  never calls `sync_agent_bindings_for_draft` or `AgentDslService`, so neither
+  agent-v2 binding is backed by a record there. `wf.dify_agent()` and
+  `wf.inline_agent()` are therefore on the app document only; `wf.agent()`, a
+  plugin strategy that needs no binding, is on both.
+- **A knowledge pipeline is not an app, and almost nothing about it is
+  shared.** It imports at `/rag/pipelines/imports`, publishes at
+  `/rag/pipelines/<id>/workflows/publish`, and its DSL is `kind: rag_pipeline`
+  at **version 0.1.0** — sending the app's `0.7.0` makes Dify hold the import
+  for confirmation, which reads like a failure and is a second round trip.
+  Four more things it does not share:
+  - **The import payload's `name` is accepted and never read.**
+    `import_rag_pipeline` takes `dataset_name` and does nothing with it; the
+    knowledge base is named from the document's `rag_pipeline.name`.
+  - **That name always gets a number appended.**
+    `generate_incremental_name` returns `"<name> 1"` even when nothing
+    collides, so a pipeline called `support-docs` fills a base called
+    `support-docs 1`. Address the base by the `dataset_id` the import
+    returns; looking it up by name finds nothing.
+  - **The knowledge-index node is validated as a `KnowledgeConfiguration`,
+    which requires `retrieval_model`.** Without it the import fails with a
+    pydantic error about a field the DSL never mentions. `wf.knowledge_index`
+    always writes one.
+  - **A knowledge-index node takes chunks, not text.** Dify validates what
+    reaches it as a structured chunk, so an extractor wired straight into it
+    queues the document and then fails *indexing* — "Input should be a valid
+    dictionary or instance of MultimodalGeneralStructureChunk". Chunks come
+    from a chunker plugin (`langgenius/general_chunker` after
+    `langgenius/dify_extractor` in Dify's own templates), which is a tool node.
+  - **A pipeline input belongs to a datasource, or to `shared`.**
+    `belong_to_node_id` is the datasource whose form shows it, or the literal
+    `shared`, which is where Dify's templates keep the chunking settings every
+    source uses. Dify fills in the inputs of the datasource being used and
+    nothing else, so one owned by a processing node is read as unset at run
+    time rather than refused at import — the builder refuses it instead.
+  - **There is no route that deletes a pipeline.** The knowledge base owns it:
+    `DELETE /datasets/<dataset_id>` removes both. A pipeline has no listing of
+    its own either — it is reported by the dataset rows that carry a
+    `pipeline_id`.
 - **The running version is at `GET /v1/`** — the Service API's own index, no
   credential, always served, `server_version` in the body. Two places look like
   they would answer and do not: `/openapi/v1/_version` needs `OPENAPI_ENABLED`,

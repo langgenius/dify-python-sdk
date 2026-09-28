@@ -7,23 +7,34 @@ is why they are here and not on :class:`~dify_client.DifyApp`.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, List
+from uuid import uuid4
 
 import httpx
 
 from ..catalog import ModelProvider
 from ..exceptions import TransportError
-from ..lifecycle import Deployment
-from ..results import Page
+from ..lifecycle import Deployment, PipelineDeployment
+from ..results import Page, WorkflowRun
 from ._base import Console, Resource
 
 if TYPE_CHECKING:
     from ..app import DifyApp
     from ..console import App
 
-__all__ = ["Agents", "Apps", "Keys", "ManagedApp", "Models", "Skills", "Triggers"]
+__all__ = [
+    "Agents",
+    "Apps",
+    "Keys",
+    "ManagedApp",
+    "Models",
+    "Pipelines",
+    "Skills",
+    "Triggers",
+]
 
 #: The app modes Dify serves `/apps/<id>/workflows/publish` for. Every other
 #: mode keeps its configuration on the app itself, so importing it is the whole
@@ -101,6 +112,182 @@ class Agents(Resource):
 
     def retrieve(self, name_or_id: str) -> Any:
         return self._client._agent(name_or_id)
+
+
+class Pipelines(Resource):
+    """The workspace's knowledge pipelines.
+
+    A pipeline is not an app: Dify serves it from ``/rag/pipelines``, its DSL
+    is ``kind: rag_pipeline``, and importing one creates the knowledge base it
+    fills. Two ids come back for that reason — the pipeline's and the
+    knowledge base's — and deleting the knowledge base is what deletes both.
+    """
+
+    def list(self) -> List[Any]:
+        """Every knowledge base that has a pipeline behind it."""
+        return self._client._pipelines()
+
+    def import_definition(
+        self,
+        definition: Any,
+        *,
+        pipeline_id: str | None = None,
+    ) -> PipelineDeployment:
+        """Write a pipeline to Dify as a **draft**, creating its knowledge base.
+
+        Nothing indexes yet: :meth:`publish` is what makes the pipeline the one
+        documents go through, and :meth:`deploy` does both.
+
+        The knowledge base is named after the document, **plus a number**: Dify
+        appends one unconditionally, so a pipeline called ``support-docs``
+        fills a base called ``support-docs 1``. Find it by the ``dataset_id``
+        this returns rather than by name.
+
+        A DSL version older than the server's comes back unimported with an
+        ``import_id``, which :meth:`confirm` completes — the same hold the app
+        importer applies.
+        """
+        document = definition if isinstance(definition, str) else definition.to_yaml()
+        try:
+            return self._client._import_pipeline(document, pipeline_id=pipeline_id)
+        except (TransportError, httpx.TransportError) as failure:
+            # Nothing came back, so whether Dify created the pipeline and its
+            # knowledge base is unknown. Guessing either way would be wrong.
+            return PipelineDeployment(indeterminate=True, error=str(failure))
+        except Exception as failure:  # noqa: BLE001 - Dify said no; that is a state
+            return PipelineDeployment(imported=False, error=str(failure))
+
+    def confirm(self, deployment: Any) -> PipelineDeployment:
+        """Confirm an import Dify held over a DSL version difference."""
+        import_id = (
+            deployment
+            if isinstance(deployment, str)
+            else getattr(deployment, "import_id", "")
+        )
+        if not import_id:
+            from ..exceptions import ValidationError
+
+            msg = (
+                "confirm() needs the import id Dify answered with. It is on the "
+                "result of import_definition(), as .import_id."
+            )
+            raise ValidationError(msg)
+        try:
+            return self._client._confirm_pipeline_import(import_id)
+        except (TransportError, httpx.TransportError) as failure:
+            # Confirming is the second half of the import, and it creates the
+            # pipeline and its knowledge base just as the first would have.
+            # With no answer, whether it did is unknown.
+            return PipelineDeployment(
+                indeterminate=True, import_id=import_id, error=str(failure)
+            )
+        except Exception as failure:  # noqa: BLE001 - Dify said no; that is a state
+            return PipelineDeployment(
+                imported=False,
+                import_id=import_id,
+                error=str(failure),
+            )
+
+    def publish(self, pipeline: Any) -> PipelineDeployment:
+        """Publish a pipeline's draft, making it the one documents go through."""
+        pipeline_id = _pipeline_id(pipeline)
+        self._client._publish_pipeline(pipeline_id)
+        dataset_id = (
+            getattr(pipeline, "dataset_id", "") if not isinstance(pipeline, str) else ""
+        )
+        return PipelineDeployment(
+            imported=True,
+            published=True,
+            pipeline_id=pipeline_id,
+            dataset_id=dataset_id,
+        )
+
+    def deploy(
+        self,
+        definition: Any,
+        *,
+        pipeline_id: str | None = None,
+        publish: bool = True,
+    ) -> PipelineDeployment:
+        """Import a pipeline and publish it, reporting where it stopped."""
+        imported = self.import_definition(definition, pipeline_id=pipeline_id)
+        if not imported.imported or not publish:
+            return imported
+        try:
+            self._client._publish_pipeline(imported.pipeline_id)
+        except (TransportError, httpx.TransportError) as failure:
+            # Nothing came back. The publish may have happened, so reporting
+            # an unpublished draft would send the caller to retry or clean up
+            # something that is possibly already live.
+            return PipelineDeployment(
+                imported=True,
+                indeterminate=True,
+                pipeline_id=imported.pipeline_id,
+                dataset_id=imported.dataset_id,
+                import_id=imported.import_id,
+                error=str(failure),
+                payload=imported.payload,
+            )
+        except Exception as failure:  # noqa: BLE001 - Dify said no; that is a state
+            # The pipeline exists and is unpublished. The caller can retry the
+            # publish or delete the knowledge base.
+            return PipelineDeployment(
+                imported=True,
+                pipeline_id=imported.pipeline_id,
+                dataset_id=imported.dataset_id,
+                import_id=imported.import_id,
+                error=str(failure),
+                payload=imported.payload,
+            )
+        return PipelineDeployment(
+            imported=True,
+            published=True,
+            pipeline_id=imported.pipeline_id,
+            dataset_id=imported.dataset_id,
+            import_id=imported.import_id,
+            imported_dsl_version=imported.imported_dsl_version,
+            current_dsl_version=imported.current_dsl_version,
+            payload=imported.payload,
+        )
+
+    def export(self, pipeline: Any, *, include_secret: bool = False) -> str:
+        """The pipeline's DSL, as the console's Export button writes it."""
+        return self._client._export_pipeline(
+            _pipeline_id(pipeline), include_secret=include_secret
+        )
+
+    def delete(self, dataset: Any) -> None:
+        """Delete the knowledge base, and with it the pipeline that fills it.
+
+        Takes the **dataset** id, not the pipeline id: the knowledge base owns
+        the pipeline, and there is no route that deletes one on its own.
+        """
+        dataset_id = (
+            dataset
+            if isinstance(dataset, str)
+            else getattr(dataset, "dataset_id", None) or getattr(dataset, "id", "")
+        )
+        if not dataset_id:
+            from ..exceptions import ValidationError
+
+            msg = (
+                "delete() needs the knowledge base id, which is .dataset_id on "
+                "a deploy result — deleting the base is what deletes a pipeline."
+            )
+            raise ValidationError(msg)
+        self._client._delete_dataset(dataset_id)
+
+
+def _pipeline_id(pipeline: Any) -> str:
+    if isinstance(pipeline, str):
+        return pipeline
+    found = getattr(pipeline, "pipeline_id", None) or getattr(pipeline, "id", "")
+    if not found:
+        from ..exceptions import ValidationError
+
+        msg = "This is not a pipeline: it carries neither a pipeline_id nor an id."
+        raise ValidationError(msg)
+    return str(found)
 
 
 class Models(Resource):
@@ -282,45 +469,54 @@ class Apps(Resource):
             )
             raise ValidationError(msg)
 
-        try:
+        def attempt() -> Any:
             if isinstance(definition, str):
-                result = self._client._import_app(definition, app_id=app_id, name=name)
-            else:
-                result = self._client._deploy(definition, app_id=app_id, name=name)
-        except (TransportError, httpx.TransportError) as failure:
-            # Nothing came back. Whether Dify created the app is unknown, and
-            # guessing either way would be wrong. The console client speaks to
-            # httpx directly, so both spellings of the failure arrive here.
-            return Deployment(
-                indeterminate=True, error=str(failure), app_id=app_id or ""
-            )
-        except Exception as failure:  # noqa: BLE001 - Dify said no; that is a state
-            return Deployment(imported=False, error=str(failure), app_id=app_id or "")
+                return self._client._import_app(definition, app_id=app_id, name=name)
+            return self._client._deploy(definition, app_id=app_id, name=name)
 
-        # An import that answered 200 can still have failed. Passing an app_id
-        # used to hide that: the id came back from the argument rather than the
-        # reply, and the deploy carried on to publish whatever draft was there.
-        if not _import_succeeded(result):
-            return Deployment(
-                imported=False,
-                app_id=app_id or "",
-                error=result.error or f"Dify reported the import as {result.status!r}.",
-                warnings=tuple(result.warnings or ()),
-                payload={"import": result.__dict__},
-            )
+        return _imported(attempt, app_id=app_id, definition=definition)
 
-        resolved = result.app_id or app_id or ""
-        if not resolved:
-            return Deployment(
-                imported=False, error="Dify accepted the import but returned no app id."
-            )
-        return Deployment(
-            imported=True,
-            app_id=resolved,
-            app_mode=str(result.app_mode or getattr(definition, "mode", "") or ""),
-            created=app_id is None,
-            warnings=tuple(result.warnings or ()),
-            payload={"import": result.__dict__},
+    def confirm(self, deployment: Any) -> Deployment:
+        """Confirm an import Dify held over a DSL version difference.
+
+        Takes the held result, or the import id on it. Until this is called, a
+        new app does not exist and an overwrite has not changed the existing
+        app — a held import is a question, not a draft.
+        """
+        return _confirmed(deployment, self._client._confirm_import)
+
+    def run_draft(
+        self,
+        app: Any,
+        inputs: Mapping[str, Any] | None = None,
+        *,
+        query: str | None = None,
+        conversation_id: str | None = None,
+    ) -> WorkflowRun:
+        """Run what an app's draft says, without publishing it.
+
+        The draft is what :meth:`import_definition` writes and the published
+        version is what the Service API serves, so this is how a definition
+        is tried before it is released — the editor's Run button, from code::
+
+            draft = console.apps.import_definition(wf)
+            run = console.apps.run_draft(draft, {"q": "hello"})
+
+        It runs as the console account, and appears in the app's logs as a
+        debugging run. A chatflow needs ``query``.
+        """
+        app_id = _app_id(app)
+        mode = getattr(app, "app_mode", "") or getattr(app, "mode", "")
+        if not mode:
+            # A bare id says nothing about which of the two draft routes
+            # serves it, and Dify refuses the wrong one.
+            mode = self._client._app(app_id).mode
+        return self._client._run_draft(
+            app_id,
+            mode=str(mode),
+            inputs=inputs,
+            query=query,
+            conversation_id=conversation_id,
         )
 
     def publish(self, app: Any) -> Deployment:
@@ -415,14 +611,22 @@ class Apps(Resource):
         raises, and even when the deploy itself fails partway — an app that was
         created but could not be published is still an app.
         """
+        # A name no one else has, so that an app created by an import whose
+        # answer never came back can be found again — and only that app.
+        unique = name is None and bool(getattr(definition, "name", ""))
+        if unique:
+            name = f"{definition.name}-temporary-{uuid4().hex[:6]}"
         result = self.deploy(definition, name=name)
         app = ManagedApp(self._client, result)
         try:
+            if result.indeterminate and not result.imported and unique and name:
+                # The import may have created the app; nothing says so, and an
+                # id to delete it by never arrived. Find it by name instead.
+                outcome = _sweep_named(self, name)
+                result = replace(result, error=f"{result.error}. {outcome}")
             result.raise_for_stage()
             yield app
         finally:
-            # An indeterminate deploy may or may not have created an app, so it
-            # is swept by prefix rather than deleted by id that may not exist.
             if result.imported and result.created and result.app_id:
                 try:
                     app.delete()
@@ -437,6 +641,136 @@ class Apps(Resource):
 _IMPORT_OK = frozenset({"completed", "completed-with-warnings"})
 
 
+def _imported(
+    attempt: Callable[[], Any], *, app_id: str | None, definition: Any = None
+) -> Deployment:
+    """What an app import came to, whichever surface it went through.
+
+    The console and ``/openapi/v1`` answer an import the same way, and the
+    second used to raise over a held one — the collapse the first had already
+    been fixed for. One reading, so the two cannot drift apart again.
+    """
+    try:
+        result = attempt()
+    except (TransportError, httpx.TransportError) as failure:
+        # Nothing came back. Whether Dify created the app is unknown, and
+        # guessing either way would be wrong. The console client speaks to
+        # httpx directly, so both spellings of the failure arrive here.
+        return Deployment(indeterminate=True, error=str(failure), app_id=app_id or "")
+    except Exception as failure:  # noqa: BLE001 - Dify said no; that is a state
+        return Deployment(imported=False, error=str(failure), app_id=app_id or "")
+
+    # An import that answered 200 can still have failed. Passing an app_id
+    # used to hide that: the id came back from the argument rather than the
+    # reply, and the deploy carried on to publish whatever draft was there.
+    if not _import_succeeded(result):
+        # A held import is not a refused one: the import record exists and
+        # confirm() completes it, so reporting "nothing was created" would
+        # send the caller to build something Dify is already holding.
+        held = bool(getattr(result, "needs_confirmation", False))
+        if held:
+            reason = (
+                f"Dify wants this import confirmed: the document is DSL "
+                f"{result.imported_dsl_version} and the server is on "
+                f"{result.current_dsl_version}. Call apps.confirm(result) "
+                "once you are satisfied the difference is safe."
+            )
+        else:
+            reason = result.error or f"Dify reported the import as {result.status!r}."
+        return Deployment(
+            imported=False,
+            app_id=app_id or "",
+            import_id=str(result.id or ""),
+            needs_confirmation=held,
+            error=reason,
+            warnings=tuple(result.warnings or ()),
+            payload={"import": result.__dict__},
+        )
+
+    resolved = result.app_id or app_id or ""
+    if not resolved:
+        return Deployment(
+            imported=False, error="Dify accepted the import but returned no app id."
+        )
+    return Deployment(
+        imported=True,
+        app_id=resolved,
+        app_mode=str(result.app_mode or getattr(definition, "mode", "") or ""),
+        created=app_id is None,
+        warnings=tuple(result.warnings or ()),
+        payload={"import": result.__dict__},
+    )
+
+
+def _confirmed(deployment: Any, confirm: Callable[[str], Any]) -> Deployment:
+    """Confirm a held import, on whichever surface held it.
+
+    ``created`` is what makes deleting the app safe, so it is claimed only when
+    the held result shows the import was a new app — one with no ``app_id``.
+    Given a bare import id there is no telling, and not knowing is reported as
+    not created: confirming an overwrite used to report the caller's own app
+    as one this session made.
+    """
+    from ..exceptions import ValidationError
+
+    if isinstance(deployment, str):
+        import_id, created = deployment, False
+    else:
+        import_id = getattr(deployment, "import_id", "")
+        created = isinstance(deployment, Deployment) and not deployment.app_id
+    if not import_id:
+        msg = (
+            "confirm() needs the import id Dify answered with. It is on the "
+            "result of import_definition(), as .import_id."
+        )
+        raise ValidationError(msg)
+    try:
+        result = confirm(import_id)
+    except (TransportError, httpx.TransportError) as failure:
+        # The second half of the same import, which can equally leave an app
+        # behind; with no answer, whether it did is unknown.
+        return Deployment(indeterminate=True, import_id=import_id, error=str(failure))
+    except Exception as failure:  # noqa: BLE001 - Dify said no; that is a state
+        return Deployment(imported=False, import_id=import_id, error=str(failure))
+    if not _import_succeeded(result):
+        return Deployment(
+            imported=False,
+            import_id=import_id,
+            error=result.error or f"Dify reported the import as {result.status!r}.",
+            payload={"import": result.__dict__},
+        )
+    return Deployment(
+        imported=True,
+        app_id=str(result.app_id or ""),
+        app_mode=str(result.app_mode or ""),
+        import_id=import_id,
+        created=created,
+        warnings=tuple(result.warnings or ()),
+        payload={"import": result.__dict__},
+    )
+
+
+def _sweep_named(apps: Any, name: str) -> str:
+    """Delete every app called exactly ``name``, and say what came of it.
+
+    For an import whose answer never arrived: it may have created the app, and
+    no id came back to delete it by. Only safe for a name made unique for the
+    purpose — the listing matches by substring, so this matches exactly.
+    """
+    try:
+        found = [app for app in apps.list(name=name).all() if app.name == name]
+        for app in found:
+            apps.delete(app.id)
+    except Exception as failure:  # noqa: BLE001 - reported, not raised over
+        return (
+            f"Looking for it failed too ({failure}); check the workspace for "
+            f"an app called {name!r}"
+        )
+    if found:
+        return f"An app called {name!r} had been created anyway, and was deleted"
+    return f"No app called {name!r} was created"
+
+
 def _import_succeeded(result: Any) -> bool:
     status = str(getattr(result, "status", "") or "")
     # An older Dify omits the field; an app id coming back is then the signal.
@@ -445,6 +779,4 @@ def _import_succeeded(result: Any) -> bool:
 
 def _with(base: Deployment, **changes: Any) -> Deployment:
     """A copy of the deployment with these fields changed."""
-    from dataclasses import replace
-
     return replace(base, **changes)

@@ -309,3 +309,61 @@ class TestPipeline:
 
         with pytest.raises(APIError, match="has no RAG pipeline"):
             knowledge.pipeline(dataset).datasources()
+
+
+class TestHowABaseIsSearched:
+    """Embedding and reranking are settings on the base, so they outlive a call."""
+
+    def _model(self, management, model_type):
+        names = management.models.names(model_type)
+        if not names:
+            pytest.skip(f"this Dify has no {model_type} provider configured")
+        return names[0]
+
+    def test_an_embedding_model_is_stored_on_the_base(self, knowledge, management):
+        import uuid
+
+        embedding = self._model(management, "text-embedding")
+        base = knowledge.datasets.create(
+            f"{HARNESS_DATASET}-embedded-{uuid.uuid4().hex[:6]}",
+            indexing_technique="high_quality",
+            embedding=embedding,
+        )
+        try:
+            read = knowledge.datasets.retrieve(base).payload
+            assert f"{read['embedding_model_provider']}:{read['embedding_model']}" == (
+                embedding
+            )
+        finally:
+            knowledge.datasets.delete(base)
+
+    def test_a_rerank_model_is_stored_on_the_base(self, knowledge, management):
+        """Storing it and using it are two questions; the second is billed."""
+        import uuid
+
+        from dify_client import retrieval_model
+
+        rerank = self._model(management, "rerank")
+        base = knowledge.datasets.create(
+            f"{HARNESS_DATASET}-reranked-{uuid.uuid4().hex[:6]}",
+            indexing_technique="high_quality",
+            embedding=self._model(management, "text-embedding"),
+            retrieval=retrieval_model(
+                search="hybrid_search", top_k=5, score_threshold=0.2, rerank=rerank
+            ),
+        )
+        try:
+            stored = knowledge.datasets.retrieve(base).payload["retrieval_model_dict"]
+            provider, _, name = rerank.rpartition(":")
+            assert stored["reranking_enable"] is True
+            assert stored["reranking_model"] == {
+                "reranking_provider_name": provider,
+                "reranking_model_name": name,
+            }
+            assert stored["search_method"] == "hybrid_search"
+            # The threshold and its flag are one setting in the UI and two
+            # fields here; a value with the flag off is stored and ignored.
+            assert stored["score_threshold_enabled"] is True
+            assert stored["score_threshold"] == 0.2
+        finally:
+            knowledge.datasets.delete(base)

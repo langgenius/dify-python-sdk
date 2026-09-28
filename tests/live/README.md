@@ -23,7 +23,21 @@ one is noise.
 Nothing, on purpose. The fixture apps are template nodes rather than model
 nodes, so the harness exercises the SDK's contract with Dify without spending
 on tokens. Tests that would call a model belong under the `billed` marker
-instead.
+instead — there is one, `test_billed_rerank.py`, which is the only way to tell
+a rerank model that is *configured* on a knowledge base from one that is
+actually *consulted*:
+
+```bash
+DIFY_LIVE_TESTS=1 uv run pytest tests/live/test_billed_rerank.py -m billed
+```
+
+It indexes sixteen short chunks, runs three workflows and makes one rerank
+call. `DIFY_LIVE_TESTS` is the only thing it asks for beyond `.env`: the
+harness logs in when the test runs, so no console token is needed. (The
+SDK's own `requires_live` does want one, because a user's billed test has no
+other way to reach Dify; the harness uses its own `billed` instead.) A skip
+here reads `DIFY_LIVE_TESTS is not set` — and a skipped billed test proves
+nothing.
 
 ## What it creates
 
@@ -33,7 +47,8 @@ harness that mints one per run stops working on the eleventh with an
 come back with their secrets masked, so reusing one is not an option.
 
 Two apps per session — one `workflow`, one `advanced-chat` — plus whatever an
-individual test needs. Everything is named `sdk-harness-…` and deleted at the
+individual test needs, including knowledge pipelines, which are deleted through
+the knowledge base that owns them. Everything is named `sdk-harness-…` and deleted at the
 end, including anything a crashed earlier run left behind: the session sweeps
 leftovers by prefix before it finishes.
 

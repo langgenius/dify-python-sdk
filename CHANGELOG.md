@@ -89,6 +89,210 @@ a newer Dify adds still reaches the caller.
 
 ### Fixed
 
+**Four from a sixth review.**
+
+- **Confirming a held overwrite reported the caller's app as created.**
+  `created` is what makes deleting an app safe. `confirm()` on either surface
+  now claims it only when the held result shows a new app; given a bare
+  import id, where there is no telling, it claims nothing. The console and
+  `/openapi/v1` share one `confirm`.
+- **An import whose answer never arrived could leave a temporary app
+  behind.** With no answer there is no id, and cleanup deleted by id.
+  `run_live()` and `apps.temporary()` now find the app by its exact name —
+  one made unique for the purpose, so a name the caller chose is never swept
+  — delete it, and say whether there was one. Checked on Dify, including that
+  an app whose name only starts with ours is left alone.
+- **An if-else case keyed `"false"` shared the else arm's handle**, so one of
+  the two was never taken. graphon continues along `"false"` when no case
+  matched; that key is refused.
+- **`upload_for_pipeline(open("handbook.pdf", "rb"))` was refused** — the
+  open file was sent as `document`, with no extension — and by then its bytes
+  had been read, so a retry sent nothing. An open file goes up under its own
+  name, and the name is checked before anything is read.
+
+- **`/openapi/v1` raised over a held import and could not import a string.**
+  `OpenApiApps.import_definition` now reads an import the way the console path
+  does — one shared reading, so the two cannot drift again: a held import
+  comes back with `needs_confirmation` and an `import_id`, a lost answer comes
+  back `indeterminate`, and `OpenApiApps.confirm()` completes a held one. A
+  string of DSL was handed to a method that called `.to_yaml()` on it and
+  raised `AttributeError`; it is imported now. All three checked on Dify with
+  a bearer minted for the test and revoked after it.
+
+**Three from a fifth review.**
+
+- **A node after one arm of a branch ran when the other arm was taken.** The
+  node wired to the arm was left alone; one further down that also read the
+  start node got an inferred edge from it, and Dify skips a node only when
+  every way in was skipped. An inferred edge is now dropped when its target
+  sits after a branch its source does not. Run on Dify: the arm not taken
+  no longer runs, and an aggregator after both arms still rejoins them.
+- **`weights=` on a knowledge node over several bases was never applied.**
+  Dify merges them with the weights only when `reranking_enable` is set
+  (`core/rag/retrieval/dataset_retrieval.py`), and it was left off — as
+  Dify's own editor also leaves it. The node sets it; a knowledge base's
+  stored settings, where hybrid search reads the weights regardless, do not
+  change. Measured on Dify with a billed test: with the flag on, a 0.5 / 0.5
+  weighting scored every chunk at exactly half the unweighted merge; with it
+  off, the scores were identical to no weighting at all.
+- **`body.until()` replaced the conditions `wf.loop(until=…)` was given.**
+  They are added now. All of a loop's conditions share one operator, so a
+  different `logical=` once there are conditions is refused.
+
+**Three that imported, published and never ran,** from a fourth review. Each
+was reproduced first, and the fixed shapes were run on Dify 1.17.1.
+
+- **An edge inferred out of a branch was never taken.** Inference wrote every
+  edge with the handle `source`, and a classifier, an if-else or a form only
+  follows edges named after one of its arms. A node reading
+  `kind["class_name"]` with no `connect()` passed `validate()`, and a local
+  run reported `succeeded` with empty outputs. Nothing is inferred out of a
+  branch now; `validate()` asks which arm leads to the node, and
+  `wf.connect(branch, node)` with no arm — or with a name that is not one —
+  is refused where it is written.
+- **The human-input timeout arm was spelled `timeout`.** Dify's engine and
+  editor both use `__timeout`, so the edge `approval()` drew for it was never
+  followed and a form nobody answered stopped the run. `Branch.timeout` is
+  that arm, and `case("timeout")` says to use it.
+- **Only the first node in a container body ran from the start marker.** A
+  second node reading `each.item` had no way in, and every pass returned
+  `None` for it. The marker now leads to every body node nothing inside the
+  body leads to, and `validate()` refuses any node with a way out and none in.
+
+**Six more from the same round.**
+
+- **A bare node was text but not a reference.** `wf.end({"answer": reply})`,
+  `wf.knowledge(reply, …)`, `when(reply, …)`, `each.returns(node)` and the
+  rest raised `AttributeError: 'Node' object has no attribute 'selector'`.
+  Every argument that names a value takes a node for its output now, and
+  anything else is a `TypeError` naming the argument. `loop_var()` and
+  `assign()` wrote a node as a constant; they write it as a variable.
+- **`wf.http(json={"q": start["q"]})` raised `TypeError`**, the one text
+  argument of that node not rendered. A reference is written as the template,
+  quoted — Dify substitutes it into the body text and then parses it.
+- **A lost `confirm()` answer raised** instead of reporting `indeterminate`,
+  the collapse `import_definition` was already guarded against. A refused
+  confirm is reported as refused, not as still held.
+- **`knowledge_index(retrieval=…, top_k=10)` dropped `top_k`**, the case its
+  own check existed for. `top_k` and `score_threshold` are refused beside
+  `retrieval=` now.
+- **`hasattr(loop, "item")` raised** instead of answering `False`; the
+  wrong-container error is an `AttributeError` as well as a `WorkflowError`.
+- **`as_dsl()` is deleted.** Nothing called it, and it still rendered a node
+  as its id.
+
+**Nine from a third review, each reproduced before it was fixed.** They share
+a shape: something the docstring promised that the code did not do.
+
+- **A node in an f-string rendered as its id.** `Text` accepts a node so that
+  `wf.answer(reply)` works, but `f"Reply: {reply}"` — the one place the SDK
+  cannot intercept — emitted the literal `Reply: llm`. `Node.__str__` is the
+  node's output now, the same as everywhere else it is accepted as text.
+- **An inline Agent skipped the checks an Agent app gets.** "Needs a name" and
+  "empty soul" lived in `Agent.to_dict()`, which a workflow shipping an inline
+  Agent never calls; they live in `to_package()` now, which both go through,
+  and the workflow's refusal names the binding that is wrong.
+- **A `workflow` app accepted conversation variables** and wrote them into the
+  DSL, where Dify has nowhere to keep them. Declaring one on a fixed
+  `mode="workflow"` refuses immediately; on an app whose mode is not settled
+  yet — it becomes a chatflow at `wf.answer(...)` — it is refused when the
+  document is rendered, because absent is not the same as not yet determined.
+- **A held import read as a refused one.** Dify answers a DSL version
+  difference with `pending` and *keeps* the import, so `raise_for_stage()`
+  said "Nothing was created on Dify" while a confirmable import sat on the
+  server. Both `Deployment` and `PipelineDeployment` now carry
+  `needs_confirmation` and `import_id`, and the refusal names `confirm(...)`.
+- **`wf.knowledge(mode="single")` dropped `top_k` and `score_threshold`.** A
+  single-mode node carries no retrieval config, so those numbers reached
+  nothing and the search ran with the knowledge base's own settings. They are
+  refused there now, the way `rerank=` and `weights=` already were.
+- **`form_select` documented a variable-sourced option list and always wrote a
+  constant**, so a selector became the dropdown's choices — two words instead
+  of the array they pointed at. It takes a `VarRef` now, and a bare string is
+  refused rather than split into one option per letter.
+- **`datasets.create(embedding=…)` raised a bare `ValueError`**, outside the
+  SDK's own hierarchy, so `except DifyClientError` missed the most likely
+  failure there — a mistyped model reference. Both the sync and async twins
+  raise `ValidationError`.
+- **`grounded_answer(instruction=…)` ran `str.format` on caller text**, so an
+  instruction showing the model a JSON example raised `KeyError` on the
+  example's own braces. `{context}` and `{question}` are substituted and
+  nothing else is touched; an instruction naming neither is refused, because
+  the answer it produces would not be grounded.
+- **The `loop()` docstring showed an example that raised `NameError`**, and
+  the API it implied did not exist: `until=` is evaluated before the block
+  runs, so it could only name nodes *outside* the loop. `body.until([...])`
+  sets break conditions from inside the block, which is where a condition
+  about the body has to be written — the same shape as `each.returns(...)`.
+
+**Seven more from a second review, again reproduced first.**
+
+- **A node handed to `wf.llm()` as the whole prompt hung the process.** The
+  new `Text` alias let one through to `list(prompt)`, and `Node.__getitem__`
+  answered `node[0]` with a reference rather than raising, so the iteration
+  never ended. A node is a prompt now, and indexing one by position is a
+  `TypeError` that names the fix — which protects everything else that might
+  iterate one.
+- **A lost publish response reported a definite failure.** `pipelines.deploy`
+  now marks a transport error `indeterminate`, the way importing already did:
+  the publish may have happened, and cleaning up on that assumption is worse
+  than saying so.
+- **`pipelines.list()` truncated at `MAX_WALK`** instead of raising
+  `PageLimitReached`. A listing that quietly stops early is the bug `all()`
+  exists to fix.
+- **`pipelines.delete()` reported success on a refusal.** httpx does not raise
+  on a 4xx, so a 403 left the knowledge base in place with nothing said.
+- **`when(count, ">", 5)` raised a pydantic error** about a field the caller
+  never mentioned. Dify's editor stores numbers as text, and so does this.
+- **A pipeline input could belong to a processing node.** Dify fills in the
+  inputs of the datasource being used, so one owned by anything else reads as
+  unset at run time; it is refused at build time.
+- **An edge written by hand can replace a derived one**, which the knowledge
+  pipeline example did: connecting a chunker straight to its datasource left
+  the extractor with nothing leading to it, so the chunker ran on nothing.
+  `validate()` now refuses a graph where a node reads something no path leads
+  to, and the example wires nothing by hand.
+
+**Six fixes from a review of the builder, each reproduced before it was
+changed.**
+
+- `grounded_answer()` rendered a *node* handed to it as its id, so the prompt
+  asked "Question: cleaned" instead of the text. The knowledge half resolved
+  it and the prompt half did not; both go through one resolution now.
+- `pipelines.list()` read one page of thirty knowledge bases and stopped,
+  while promising every pipeline. Most bases are not pipelines, so the only
+  one in a workspace could sit behind thirty that are not. It walks the pages,
+  stopping at `MAX_WALK` like every other listing.
+- `indexing="high_quality"` accepted a `retrieval=` block in place of an
+  embedding model and wrote a base with neither. Search settings are not a
+  place to store chunks; the model is required whatever else is passed.
+- A container built inside another was written at the top level, which left
+  the outer one reported as empty. A nested iteration or loop is parented like
+  any other node.
+- A container's start marker took `<id>start` without claiming it, so a node
+  already called that produced two nodes under one id. The marker's id is
+  claimed like any other and the container points at whatever it got.
+- The knowledge-pipeline example and the README wired an extractor straight
+  into the knowledge base, which queues a document and then fails indexing.
+  Both now build the chain Dify's own templates use, and
+  `recipes.file_pipeline` / `recipes.chunked_text` ship it.
+
+**Running a knowledge pipeline was broken in two places**, both only
+reachable once a pipeline could be built from code rather than by hand in the
+console.
+
+- `pipeline.datasources()` read the answer as `{"data": [...]}`. Dify sends a
+  bare array there — it is a `RootModel[list[...]]`, unlike every other
+  listing in the knowledge API — so the call raised `AttributeError` against a
+  real pipeline. Both shapes are read now.
+- `upload_for_pipeline()` sent every file under the name `upload`, with no
+  extension. Dify picks a document reader by extension, so the upload answered
+  200 and the document failed *indexing* with "Unsupported Extension Type: ."
+  long after the call returned. The path's own name is kept, and a file with
+  no extension is refused before it is sent.
+
+
+
 Bugs that produced a wrong answer rather than an error, which is why a green
 test suite did not catch them:
 
@@ -109,7 +313,13 @@ test suite did not catch them:
   execution; `result.runs_of(node_id)` exposes them.
 - **`run_live()` tested the wrong version.** It imported the DSL but never
   published it, and the Service API runs the published version — so a live run
-  measured whatever was published before.
+  measured whatever was published before. It now runs the draft it imported,
+  in a temporary app it deletes afterwards, and publishes nothing. (A first
+  fix published over the named app, which replaced what that app's users were
+  served with the code under test.) `app_id=` runs an existing app's draft and
+  leaves its published version alone; `apps.run_draft()` is the underlying
+  call. Checked on Dify: a named app's draft run answered with the new
+  definition while the Service API still served the old one.
 - **A failed `provision()` left the app behind.** `ephemeral_app()` never
   reached its cleanup when publishing or key creation failed.
 - **`None` query parameters went out as empty strings.** httpx renders
@@ -309,6 +519,137 @@ run = app.workflows.runs.create({"text": "…"})  # -> WorkflowRun
   token and rejects writes without it, so an access token alone could read but
   not deploy.
 
+**Every node type Dify serves, with a typed helper.** `wf.knowledge`,
+`wf.if_else`, `wf.http`, `wf.classify`, `wf.extract_parameters`,
+`wf.extract_text`, `wf.aggregate`, `wf.assign`, `wf.list_operator`,
+`wf.iteration`, `wf.loop`, `wf.human_input`, `wf.agent`, `wf.dify_agent`,
+`wf.inline_agent`, `wf.datasource`, `wf.knowledge_index` and
+`wf.plugin_trigger`, alongside the ones that were already there. Each was
+imported into a running Dify 1.17.1 and published before it was written down.
+
+- `when(...)` and `of_file(...)` build conditions, checking the operator
+  against graphon's own list — Dify spells inequality `≠`, and `!=` imports
+  fine and then never fires.
+- `bearer`, `basic` and `api_key` build HTTP credentials; `parameter()` builds
+  an extractor field; `action()`, `form_paragraph()`, `form_select()`,
+  `form_file()` and `form_files()` build a human-input form.
+- `wf.iteration()` and `wf.loop()` are context managers: nodes built inside the
+  block belong to the container, which is what `parentId` in the DSL says and
+  what makes Dify draw them inside the box.
+- `wf.conversation_var()` declares a variable that survives between the
+  messages of a chatflow, which `wf.assign()` writes to.
+- `knowledge=StubKnowledge([...])` answers knowledge nodes in a local run, the
+  way `StubLLM` answers model nodes. The chunks it returns carry the keys a
+  live 1.17.1 run sends, so a workflow that indexes them keeps working once
+  deployed. Retrieval quality is the server's, not the stub's.
+- A run that contains a node graphon cannot execute now fails saying which type
+  and what to do about it, rather than "Unsupported node types".
+- Two ways to put a Dify Agent in a workflow, which are not the same thing.
+  `wf.dify_agent(agent)` binds a published Agent the workspace already has —
+  shared, and republishing it changes every workflow bound to it.
+  `wf.inline_agent(agent)` ships a `dify_client.Agent` inside the document
+  under `agent_packages`, and Dify creates an Agent owned by that node, so the
+  workflow is self-contained. `declared_output()` names what either must
+  answer with, and `Agent.to_package()` is the shape both routes export.
+- `body.stop()` inside a loop is Dify's loop-end node: `until=` is checked
+  between passes, this leaves during one.
+
+**Embedding and reranking, where the knowledge base keeps them.**
+`datasets.create(embedding=…, retrieval=…)` on both the sync and async
+knowledge clients, and the same two on `wf.knowledge_index(...)`, so a base
+built here searches the way it was meant to rather than on Dify's defaults.
+
+- `retrieval_model()` builds the block, and `weighted_score()` the other
+  reranking mode. A rerank model and a weighted score are refused together:
+  Dify runs one or the other.
+- A score threshold sets the flag that makes Dify read it. Passing no
+  threshold leaves the filter off, and those are two states, not one.
+- `wf.knowledge(..., weights=...)` gives the knowledge-retrieval node the same
+  choice.
+- A billed live test indexes the same chunks into two knowledge bases and
+  compares the scores, which is the only way to tell a rerank model that is
+  configured from one that is consulted.
+
+**Knowledge pipelines, built and deployed like workflows.** `Pipeline` writes
+a `kind: rag_pipeline` document — a datasource at the front, a knowledge base
+at the back, ordinary workflow nodes in between — and
+`DifyManagement.pipelines` imports, confirms, publishes, exports, lists and
+deletes one.
+
+- A pipeline carries its own DSL version (`0.1.0`, not the app's `0.7.0`);
+  sending the app's makes Dify hold the import for confirmation.
+- `pipe.variable(datasource, name)` declares an input, which is a three-part
+  reference (`{{#rag.<node>.<name>#}}`) and a form in Dify's UI. `VarRef` grew
+  an optional third segment for it. `pipe.variable(None, name)` declares one in
+  the `shared` scope instead, which is where Dify's own templates keep the
+  chunking settings every datasource uses.
+- A deploy answers with `PipelineDeployment`, which keeps `pipeline_id` and
+  `dataset_id` apart: the knowledge base owns the pipeline, so deleting the
+  base is what deletes both, and Dify names the base after the pipeline *plus a
+  number*.
+- `wf.knowledge_index()` always writes the search settings Dify validates the
+  node against; without them the import fails on a field the DSL never
+  mentions.
+- `examples/10_knowledge_pipeline.py` builds one, prints what it would deploy,
+  and deploys it when the live gate is open — which costs nothing, because
+  nothing is indexed.
+
+**Edges are derived from the references that already imply them.** A node
+built with `variables={"n": start["name"]}` has said it runs after `start`;
+writing `wf.connect(start, greet)` as well was bookkeeping the SDK could do
+itself, and forgetting it was the most common way to build a workflow that
+imports and does nothing.
+
+- `wf.connect` is now for control flow: which arm of a branch to take. Arms
+  name themselves — `branch.true`, `branch.false`, `kind.case("refund")`,
+  `gate.case("approve")` — so a handle is never a typed string.
+- `wf.merge(a, b)` builds the variable aggregator that rejoins branches, which
+  the examples previously told you to remember.
+- A node stands for its own output where text is wanted, so `wf.answer(reply)`
+  reads as well as `wf.answer(reply.output)`.
+- `wf.edges` shows what will be sent. Two rules keep the derivation honest,
+  and both were bugs first: a node whose inbound edges were written by hand is
+  left alone, and nothing is inferred across a container boundary.
+
+**Recipes: the shapes most apps turn out to be.**
+`dify_client.workflow.recipes` ships `rag_answer` — a deployable chatflow that
+answers from a knowledge base — and the fragments `grounded_answer`,
+`extract_fields` and `approval`, which add their nodes to a workflow you own
+and hand back what to read next. Each is deployed to a real Dify by a test,
+and the grounding prompt is part of the recipe rather than left to the caller.
+
+**One graph, two documents.** `GraphDocument` holds what an app and a
+knowledge pipeline share — the nodes, the edges, the canvas, the environment
+variables, and every node helper that is not an end — and `Workflow` and
+`Pipeline` each add their own ends, envelope and `validate()`. A pipeline no
+longer inherits `start()`, `answer()`, `end()`, the triggers,
+`conversation_var()` or `run_live()`, none of which it could have used: an
+answer node in a pipeline used to build and validate cleanly.
+
+- `Iteration` and `Loop` replace a single `Container` with a `kind` flag.
+  `item` / `index` / `returns` belong to one and `var` / `stop` to the other,
+  so the type says which, and reaching for the wrong one still names the fix.
+- `dify_client.workflow.nodes` holds one module per node family — `agents`,
+  `human_input`, `http`, `knowledge`, `logic`, `models`, `tools`, `triggers` —
+  carrying both the schema, where this SDK owns it, and what Dify accepts of
+  that node type. The builder's helpers are their signatures, their
+  documentation and a call; the rules moved to the node they are about, and
+  can be tested without a document. `dify_client.workflow.local_knowledge`
+  keeps the stand-in that runs a knowledge node without a server.
+- The model reference splitter, the node-argument classifier and the
+  deploy-stage rules each had two copies; each has one. `AgentInput` is
+  `NodeInput`, because a datasource and a trigger take the same shape.
+- `retrieval_model()` is the single place that decides what reranking means;
+  the knowledge node validates its output rather than deciding again.
+- `wf.dify_agent()` and `wf.inline_agent()` are an app's. A pipeline accepted
+  them, published, and dropped the agent package on the way — a node bound to
+  something that was no longer in the document. `wf.agent()` needs no binding
+  and stays on both.
+- `body.until([...])` on a loop, `Apps.confirm(...)` for an import Dify held
+  over a DSL version difference, and `NodeError` exported — a field builder
+  called on its own, such as `form_select`, raises it, so it has to be
+  nameable. `form_select` and `form_paragraph` both take a `VarRef` now.
+
 ### Removed
 
 - Six async classes — `AsyncEnterpriseClient`, `AsyncSecurityClient`,
@@ -366,14 +707,10 @@ run = app.workflows.runs.create({"text": "…"})  # -> WorkflowRun
 
 ### Known gaps
 
-- Branching, iteration and loop nodes are still built with `wf.add()` and a
-  graphon entity; only the common nodes have typed helpers.
-- The knowledge surface has no async twin yet. `DifyApp` does.
 - The compatibility story is capability probing rather than a version matrix,
   deliberately — see `probe()`. What that leaves open is history: this SDK is
   verified against Dify 1.17.1, DSL 0.7.0 and graphon 0.8.0, and nothing yet
   records how far back it works.
-- No compatibility matrix yet for Dify, DSL and graphon versions. Everything
-  here was verified against Dify 1.17.1 with DSL 0.7.0 and graphon 0.8.0.
-- Branching, iteration and loop nodes still go through `wf.add()` with the
-  graphon entity; only the common nodes have typed helpers.
+- Indexing *through* a pipeline needs a chunker plugin — the knowledge-index
+  node takes structured chunks, not text — and this SDK cannot install one.
+  Build the chain with `wf.tool(...)` once the plugin is in the workspace.

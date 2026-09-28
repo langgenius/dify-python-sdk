@@ -92,16 +92,41 @@ wf.template("You said {{ q }}", variables={"q": system.query})
 
 ## Node helpers
 
-Typed helpers: `start`, `template`, `llm`, `code`, `tool`, `answer`, `end`, plus
-`webhook` and `schedule`, which start a workflow in place of `start` — those two
-only run on a deployed Dify, never locally. Every other node type goes through
-`wf.add()` with its graphon entity:
+Every node type Dify serves has a typed helper: `start`, `template`, `llm`,
+`code`, `tool`, `answer`, `end`, `knowledge`, `if_else`, `http`, `classify`,
+`extract_parameters`, `extract_text`, `aggregate`, `assign`, `list_operator`,
+`iteration`, `loop`, `human_input`, `agent` / `dify_agent` / `inline_agent`,
+`datasource`, `knowledge_index`, and `webhook` / `schedule` /
+`plugin_trigger`, which start a workflow in place of `start`. Anything
+configured beyond what a helper takes still goes through `wf.add(entity)`.
 
 ```python
-from graphon.nodes.if_else.entities import IfElseNodeData
-branch = wf.add(IfElseNodeData(title="Urgent?", cases=[...]), id="branch")
-wf.connect(branch, escalate, handle="urgent")   # handle = case id, or "false"
+from dify_client.workflow import when
+
+branch = wf.if_else([when(start["message"], "contains", "urgent")], id="branch")
+wf.connect(branch, escalate, handle="true")   # handle = case id, or "false"
 ```
+
+**Edges are mostly derived.** A node that reads another node's output is
+connected by that alone, so `wf.connect` is for control flow only — which arm
+of a branch to take, and arms name themselves (`branch.true`,
+`kind.case("refund")`). `wf.merge(a, b)` is the aggregator that rejoins them,
+and `wf.edges` shows the whole graph before it is sent. Two rules: a node
+wired by hand is left alone, and nothing crosses a container boundary.
+
+**Start from a recipe when one fits.** `dify_client.workflow.recipes` ships
+`rag_answer` (a whole chatflow) and the fragments `grounded_answer`,
+`extract_fields`, `approval` — each deployed to a real Dify by a test.
+
+**A knowledge pipeline is a different document.** `Pipeline` (same node
+helpers, `kind: rag_pipeline`) goes through `console.pipelines.deploy(...)`
+and creates a knowledge base; see `references/nodes.md`.
+
+**Not every node runs locally.** `wf.run()` is graphon, which is Dify's engine
+and not its server, so knowledge retrieval, human input, agents, the document
+extractor and the triggers have nothing to call — the failure names the type.
+Knowledge is the one with a stand-in: `wf.run(inputs,
+knowledge=StubKnowledge([...]))`. `references/nodes.md` has the full split.
 
 Indexing a node gives a reference that renders both ways Dify needs —
 `node["field"]` is `{{#node.field#}}` in text and `["node", "field"]` as a

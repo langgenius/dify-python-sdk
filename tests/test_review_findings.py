@@ -159,14 +159,17 @@ class TestCleanup:
         assert not result.created
 
 
-class TestRunLivePublishes:
-    def test_it_publishes_what_it_just_deployed(self):
-        """Without this, a live run tested the previously published version."""
+class TestRunLiveRunsThisDefinition:
+    def test_it_runs_the_draft_it_just_imported(self):
+        """Without this, a live run tested the previously published version.
+        It once published to get there; running the draft gets there without
+        releasing anything. test_workflow_live.py checks the behaviour."""
         import inspect
 
-        source = inspect.getsource(Workflow.run_live)
-        assert "apps.deploy" in source
-        assert "Stage.PUBLISHED" in source
+        source = inspect.getsource(Workflow._run_draft_on)
+        assert "import_definition" in source
+        assert "run_draft" in source
+        assert "publish" not in source.replace("publishing nothing", "")
 
 
 class TestTheBillingGateIsInTheTestingLayer:

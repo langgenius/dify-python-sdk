@@ -13,20 +13,31 @@ run the deployed app on Dify with ``wf.run_live()``.
 A trigger only becomes real on publish: importing the DSL writes a draft, and
 Dify materializes the trigger — and the webhook's URL — when the workflow is
 published.
+
+Three kinds: a webhook Dify serves itself, a schedule it keeps, and an event a
+plugin reports through a subscription the workspace holds.
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any, Literal, Sequence
 
 from graphon.entities.base_node_data import BaseNodeData
 from pydantic import BaseModel, Field
 
+from .agents import NodeInput
+
+#: The node type a plugin trigger has. Dify's enum does not name it.
+TRIGGER_PLUGIN = "trigger-plugin"
+
 #: HTTP methods a webhook trigger may listen on, as Dify spells them.
 WebhookMethod = Literal["get", "post", "head", "patch", "put", "delete"]
 
 __all__ = [
+    "TRIGGER_PLUGIN",
     "ScheduleTriggerData",
+    "TriggerEventNodeData",
     "WebhookMethod",
     "WebhookTriggerData",
     "WebhookParameter",
@@ -123,3 +134,20 @@ class ScheduleTriggerData(BaseNodeData):
     cron_expression: str | None = None
     visual_config: dict[str, Any] | None = None
     timezone: str = "UTC"
+
+
+class TriggerEventNodeData(BaseNodeData):
+    """A workflow that runs when a plugin reports an event.
+
+    Unlike a webhook, which Dify serves itself, this listens through a plugin
+    the workspace has installed and a subscription it holds; both exist on the
+    server before the node can name them.
+    """
+
+    type: str = TRIGGER_PLUGIN
+    plugin_id: str
+    provider_id: str
+    event_name: str
+    subscription_id: str
+    plugin_unique_identifier: str
+    event_parameters: Mapping[str, NodeInput] = Field(default_factory=dict)

@@ -322,3 +322,227 @@ class TestCallsThatDidNotExist:
                 attribute = getattr(group, name)
                 assert callable(attribute), f"{group}.{name}"
                 inspect.signature(attribute)
+
+
+class TestAHeldImportIsNotARefusedOne:
+    """Dify answers a DSL version difference with ``pending`` and keeps the
+    import. Reading that as "not imported" made ``raise_for_stage()`` say
+    nothing was created while a confirmable import was sitting on the server.
+    """
+
+    def pipeline_console(self, status):
+        def handler(request):
+            return httpx.Response(
+                200,
+                json={
+                    "id": "imp-7",
+                    "status": status,
+                    "pipeline_id": "",
+                    "dataset_id": "",
+                    "imported_dsl_version": "0.1.0",
+                    "current_dsl_version": "0.3.0",
+                },
+            )
+
+        return management(handler)
+
+    def test_a_held_pipeline_import_says_it_is_held(self):
+        result = self.pipeline_console("pending").pipelines.deploy("kind: rag_pipeline")
+
+        assert result.needs_confirmation is True
+        assert result.imported is False
+        assert result.import_id == "imp-7"
+
+    def test_a_refused_pipeline_import_is_not_held(self):
+        result = self.pipeline_console("failed").pipelines.deploy("kind: rag_pipeline")
+
+        assert result.needs_confirmation is False
+
+    def test_refusing_a_held_pipeline_names_confirm_rather_than_nothing(self):
+        result = self.pipeline_console("pending").pipelines.deploy("kind: rag_pipeline")
+
+        with pytest.raises(Exception) as refusal:
+            result.raise_for_stage(Stage.PUBLISHED)
+        message = str(refusal.value)
+        assert "Nothing was created on Dify" not in message
+        assert "pipelines.confirm('imp-7')" in message
+
+    def app_console(self, status):
+        def handler(request):
+            return httpx.Response(
+                200,
+                json={
+                    "id": "imp-9",
+                    "status": status,
+                    "imported_dsl_version": "0.1.0",
+                    "current_dsl_version": "0.7.0",
+                },
+            )
+
+        return management(handler)
+
+    def test_a_held_app_import_says_it_is_held(self):
+        result = self.app_console("pending").apps.import_definition(workflow())
+
+        assert result.needs_confirmation is True
+        assert result.imported is False
+        assert result.import_id == "imp-9"
+
+    def test_refusing_a_held_app_names_confirm_rather_than_nothing(self):
+        result = self.app_console("pending").apps.import_definition(workflow())
+
+        with pytest.raises(Exception) as refusal:
+            result.raise_for_stage(Stage.DRAFTED)
+        message = str(refusal.value)
+        assert "Nothing was created on Dify" not in message
+        assert "apps.confirm('imp-9')" in message
+
+    def test_confirming_completes_the_import(self):
+        calls = []
+
+        def handler(request):
+            calls.append(request.url.path)
+            if request.url.path.endswith("/confirm"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "id": "imp-9",
+                        "status": "completed",
+                        "app_id": "app-9",
+                        "app_mode": "workflow",
+                    },
+                )
+            return httpx.Response(200, json={"id": "imp-9", "status": "pending"})
+
+        console = management(handler)
+        held = console.apps.import_definition(workflow())
+        done = console.apps.confirm(held)
+
+        assert done.imported is True
+        assert done.app_id == "app-9"
+        assert done.created is True
+        assert any(path.endswith("/apps/imports/imp-9/confirm") for path in calls)
+
+    def test_confirming_an_overwrite_does_not_claim_it_created_the_app(self):
+        """Cleanup uses `created`; an existing app must never become safe to delete."""
+
+        def handler(request):
+            if request.url.path.endswith("/confirm"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "id": "imp-9",
+                        "status": "completed",
+                        "app_id": "existing",
+                        "app_mode": "workflow",
+                    },
+                )
+            return httpx.Response(200, json={"id": "imp-9", "status": "pending"})
+
+        console = management(handler)
+        held = console.apps.import_definition(workflow(), app_id="existing")
+        done = console.apps.confirm(held)
+
+        assert done.imported is True
+        assert done.app_id == "existing"
+        assert done.created is False
+
+    def test_confirming_without_an_import_id_says_where_to_find_one(self):
+        from dify_client.exceptions import ValidationError
+
+        console = management(lambda request: httpx.Response(200, json={}))
+        with pytest.raises(ValidationError, match="import id"):
+            console.apps.confirm(Deployment())
+
+
+class TestALostConfirmIsNotARefusedOne:
+    """Confirming is the second half of an import and can create the app or
+    the knowledge base just as the first half would. ``import_definition``
+    reported a lost answer as indeterminate; ``confirm`` raised."""
+
+    def lost(self):
+        def handler(request):
+            raise httpx.ReadTimeout("no answer", request=request)
+
+        return management(handler)
+
+    def test_a_lost_app_confirm_is_indeterminate(self):
+        result = self.lost().apps.confirm("imp-1")
+
+        assert result.indeterminate is True
+        assert result.stage is Stage.UNKNOWN
+        assert result.import_id == "imp-1"
+
+    def test_a_lost_pipeline_confirm_is_indeterminate(self):
+        result = self.lost().pipelines.confirm("imp-2")
+
+        assert result.indeterminate is True
+        assert result.stage is Stage.UNKNOWN
+        assert result.import_id == "imp-2"
+
+    def test_a_refused_confirm_is_not_reported_as_still_held(self):
+        """Nothing says the import is still waiting after Dify said no."""
+
+        def handler(request):
+            return httpx.Response(403, json={"message": "forbidden"})
+
+        result = management(handler).apps.confirm("imp-3")
+
+        assert result.indeterminate is False
+        assert result.needs_confirmation is False
+        assert "forbidden" in result.error
+
+
+class TestATemporaryAppIsFoundWhenItsImportWentUnanswered:
+    """An import whose answer never arrived may have created the app, and
+    there was no id to delete it by. The comment said it was "swept by
+    prefix"; nothing swept it."""
+
+    def console(self):
+        seen = {"name": None, "deleted": []}
+
+        def handler(request):
+            path = request.url.path.replace("/console/api", "")
+            if path == "/apps/imports":
+                seen["name"] = json.loads(request.content)["name"]
+                raise httpx.ReadTimeout("no answer", request=request)
+            if path == "/apps" and request.method == "GET":
+                return httpx.Response(
+                    200,
+                    json={
+                        "page": 1,
+                        "limit": 30,
+                        "total": 2,
+                        "has_more": False,
+                        "data": [
+                            {"id": "lost", "name": seen["name"], "mode": "workflow"},
+                            {"id": "theirs", "name": "w", "mode": "workflow"},
+                        ],
+                    },
+                )
+            if request.method == "DELETE":
+                seen["deleted"].append(path)
+                return httpx.Response(204)
+            return httpx.Response(200, json={})
+
+        return management(handler), seen
+
+    def test_it_is_named_so_it_can_be_found_and_is_deleted(self):
+        console, seen = self.console()
+
+        with pytest.raises(Exception, match="had been created anyway, and was deleted"):
+            with console.apps.temporary(workflow()):
+                pass
+
+        assert seen["name"].startswith("w-temporary-")
+        assert seen["deleted"] == ["/apps/lost"]
+
+    def test_a_name_the_caller_chose_is_not_swept(self):
+        """It may not be unique, and deleting by it could take someone's app."""
+        console, seen = self.console()
+
+        with pytest.raises(Exception):  # noqa: B017,PT011 - the unanswered import
+            with console.apps.temporary(workflow(), name="w"):
+                pass
+
+        assert seen["deleted"] == []

@@ -26,11 +26,12 @@ out and nothing came back, so what Dify did is genuinely not known.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, NoReturn
 
-__all__ = ["Deployment", "Stage"]
+__all__ = ["Deployment", "PipelineDeployment", "Stage"]
 
 
 class Stage(str, Enum):
@@ -50,6 +51,46 @@ class Stage(str, Enum):
 
     def __str__(self) -> str:
         return self.value
+
+
+def _stage(
+    *, indeterminate: bool, imported: bool, published: bool, keyed: bool
+) -> Stage:
+    """The one-word summary, derived from the three facts and a key."""
+    if indeterminate:
+        return Stage.UNKNOWN
+    if not imported:
+        return Stage.NOT_IMPORTED
+    if not published:
+        return Stage.DRAFTED
+    return Stage.RUNNABLE if keyed else Stage.PUBLISHED
+
+
+def _reached(stage: Stage, *, imported: bool, published: bool, runnable: bool) -> bool:
+    """Whether a deploy got as far as ``stage`` was asking for."""
+    return {
+        Stage.UNKNOWN: True,
+        Stage.NOT_IMPORTED: True,
+        Stage.DRAFTED: imported,
+        Stage.PUBLISHED: published,
+        Stage.RUNNABLE: runnable,
+    }[stage]
+
+
+def _refuse(
+    *,
+    reached: Stage,
+    wanted: Stage,
+    error: str,
+    aftermath: str,
+    payload: Mapping[str, Any],
+) -> NoReturn:
+    """Raise the one error both deploy results raise, worded by the caller."""
+    from .exceptions import APIError
+
+    detail = f": {error}" if error else ""
+    msg = f"Deploy reached {reached} but {wanted} was wanted{detail}. {aftermath}"
+    raise APIError(msg, 0, dict(payload))
 
 
 @dataclass(frozen=True)
@@ -74,6 +115,12 @@ class Deployment:
     version: str = ""
     #: Whether this deploy created the app, which is what makes deleting it safe.
     created: bool = False
+    #: The import Dify held for confirmation, when it held one.
+    import_id: str = ""
+    #: Dify is holding this import over a DSL version difference. Not the same
+    #: as a refusal: the import exists and ``apps.confirm(import_id)``
+    #: completes it.
+    needs_confirmation: bool = False
     error: str = ""
     #: True when the outcome is genuinely unknown — the request went out and no
     #: answer came back. Not the same as a failure.
@@ -88,13 +135,12 @@ class Deployment:
     @property
     def stage(self) -> Stage:
         """The one-word summary, derived from the facts above."""
-        if self.indeterminate:
-            return Stage.UNKNOWN
-        if not self.imported:
-            return Stage.NOT_IMPORTED
-        if not self.published:
-            return Stage.DRAFTED
-        return Stage.RUNNABLE if self.api_key else Stage.PUBLISHED
+        return _stage(
+            indeterminate=self.indeterminate,
+            imported=self.imported,
+            published=self.published,
+            keyed=self.has_key,
+        )
 
     @property
     def runnable(self) -> bool:
@@ -107,18 +153,16 @@ class Deployment:
 
     def raise_for_stage(self, stage: Stage = Stage.RUNNABLE) -> Deployment:
         """Raise unless the deploy got this far, otherwise return self."""
-        wanted = {
-            Stage.UNKNOWN: True,
-            Stage.NOT_IMPORTED: True,
-            Stage.DRAFTED: self.imported,
-            Stage.PUBLISHED: self.published,
-            Stage.RUNNABLE: self.runnable,
-        }[stage]
-        if wanted and not self.indeterminate:
+        if (
+            _reached(
+                stage,
+                imported=self.imported,
+                published=self.published,
+                runnable=self.runnable,
+            )
+            and not self.indeterminate
+        ):
             return self
-        from .exceptions import APIError
-
-        detail = f": {self.error}" if self.error else ""
         if self.indeterminate:
             aftermath = (
                 "Dify's answer never arrived, so whether the app exists is "
@@ -129,10 +173,108 @@ class Deployment:
                 f"App {self.app_id} exists on Dify; delete it or retry the "
                 "remaining steps."
             )
+        elif self.needs_confirmation:
+            aftermath = (
+                "Dify is holding this import over a DSL version difference; "
+                "nothing is built yet. Complete it with "
+                f"apps.confirm({self.import_id!r})."
+            )
         else:
             aftermath = "Nothing was created on Dify."
-        msg = f"Deploy reached {self.stage} but {stage} was wanted{detail}. {aftermath}"
-        raise APIError(msg, 0, dict(self.payload))
+        _refuse(
+            reached=self.stage,
+            wanted=stage,
+            error=self.error,
+            aftermath=aftermath,
+            payload=self.payload,
+        )
 
     def __str__(self) -> str:
         return f"{self.stage} {self.app_id}".strip()
+
+
+@dataclass(frozen=True)
+class PipelineDeployment:
+    """What a knowledge pipeline deploy came to.
+
+    A pipeline is not an app, and it carries two ids rather than one: the
+    ``pipeline_id`` addresses the graph and the ``dataset_id`` the knowledge
+    base it fills. Deleting the dataset is what deletes the pipeline, so
+    keeping them apart is what makes cleanup possible::
+
+        result = management.pipelines.deploy(pipeline)
+        management.pipelines.delete(result.dataset_id)
+    """
+
+    #: A draft exists on Dify.
+    imported: bool = False
+    #: A version is live, and a knowledge base will accept documents through it.
+    published: bool = False
+    pipeline_id: str = ""
+    dataset_id: str = ""
+    #: The import Dify held for confirmation, when it held one.
+    import_id: str = ""
+    #: Dify is holding this import over a DSL version difference. Not the same
+    #: as a refusal: the import exists and ``confirm(import_id)`` completes it.
+    needs_confirmation: bool = False
+    imported_dsl_version: str = ""
+    current_dsl_version: str = ""
+    error: str = ""
+    #: True when the outcome is genuinely unknown — the request went out and no
+    #: answer came back. Not the same as a failure.
+    indeterminate: bool = False
+    payload: dict[str, Any] = field(default_factory=dict, repr=False)
+
+    @property
+    def stage(self) -> Stage:
+        # A pipeline has no key to mint: publishing is as far as it goes.
+        return _stage(
+            indeterminate=self.indeterminate,
+            imported=self.imported,
+            published=self.published,
+            keyed=False,
+        )
+
+    def raise_for_stage(self, stage: Stage = Stage.PUBLISHED) -> PipelineDeployment:
+        """Raise unless the deploy got this far, otherwise return self."""
+        if (
+            _reached(
+                stage,
+                imported=self.imported,
+                published=self.published,
+                # Nothing is minted for a pipeline, so published is as
+                # runnable as it gets.
+                runnable=self.published,
+            )
+            and not self.indeterminate
+        ):
+            return self
+        if self.indeterminate:
+            aftermath = (
+                "Dify's answer never arrived, so whether the pipeline exists is "
+                "unknown — check the workspace before retrying."
+            )
+        elif self.imported:
+            aftermath = (
+                f"Pipeline {self.pipeline_id} exists on Dify; delete its "
+                f"knowledge base ({self.dataset_id}) or retry the publish."
+            )
+        elif self.needs_confirmation:
+            aftermath = (
+                f"Dify is holding this import over a DSL version difference "
+                f"({self.imported_dsl_version or 'unknown'} against the server's "
+                f"{self.current_dsl_version or 'unknown'}); nothing is built yet. "
+                f"Complete it with pipelines.confirm({self.import_id!r})."
+            )
+        else:
+            aftermath = "Nothing was created on Dify."
+        _refuse(
+            reached=self.stage,
+            wanted=stage,
+            error=self.error,
+            aftermath=aftermath,
+            payload=self.payload,
+        )
+
+    def __str__(self) -> str:
+        return f"{self.stage} {self.pipeline_id}".strip()

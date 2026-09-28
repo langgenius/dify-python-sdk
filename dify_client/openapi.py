@@ -270,13 +270,17 @@ class OpenApiClient:
         app_id: str | None = None,
         name: str | None = None,
     ) -> ImportResult:
-        """Push a code-defined Workflow or Agent to Dify."""
-        result = self._import_app(
+        """Push a code-defined Workflow or Agent to Dify.
+
+        The status is returned rather than raised, as the console's is: a held
+        import is a state the caller confirms, and raising turned it into a
+        bare failure.
+        """
+        return self._import_app(
             deployable.to_yaml(),
             app_id=app_id,
             name=name or deployable.name,
         )
-        return result.raise_for_status()
 
     def _export_app(self, app_id: str, *, include_secret: bool = False) -> str:
         """Export an app's DSL."""

@@ -20,6 +20,8 @@ keeps working.
 | [06_code_node.py](06_code_node.py) | Run a code node stubbed, and locally confined by the OS | nothing |
 | [07_agent_as_code.py](07_agent_as_code.py) | Keep a Dify Agent in version control: export, edit, redeploy | nothing |
 | [08_webhook_trigger.py](08_webhook_trigger.py) | A workflow Dify starts itself, when a webhook arrives | Dify (no model) |
+| [09_knowledge_and_iteration.py](09_knowledge_and_iteration.py) | Retrieve from a knowledge base, then iterate over the hits | nothing |
+| [10_knowledge_pipeline.py](10_knowledge_pipeline.py) | Build a knowledge pipeline, and choose how its base is searched | Dify (no model) |
 
 ## What runs where
 

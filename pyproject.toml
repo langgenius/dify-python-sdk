@@ -120,11 +120,16 @@ module = ["graphon.*", "yaml", "aiofiles"]
 ignore_errors = true
 
 [[tool.mypy.overrides]]
-# The builder deliberately takes plain strings and dicts and lets pydantic
+# The node helpers deliberately take plain strings and dicts and let pydantic
 # validate them into graphon's enums and entities, so callers never have to
 # import graphon themselves. mypy sees each of those as a type mismatch;
 # pydantic rejects a genuinely wrong value at construction time instead.
-module = ["dify_client.workflow.builder"]
+module = [
+    "dify_client.workflow.graph",
+    "dify_client.workflow.parts",
+    "dify_client.workflow.builder",
+    "dify_client.workflow.nodes.*",
+]
 disable_error_code = ["arg-type", "misc"]
 
 [tool.coverage.run]

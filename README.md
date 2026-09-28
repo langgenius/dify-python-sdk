@@ -631,19 +631,34 @@ app.chat.messages.create(text)                # fails: "message is required in i
 app.chat.messages.create("", inputs={"message": text})   # fails: query_required_for_chat
 ```
 
-### Running an app that already exists
+### Running a definition on Dify without releasing it
 
 ```python
-result = wf.run_live(
-    INPUTS,
-    console=DifyManagement(), app_id=APP_ID,   # deploy over it first
-    max_tokens=2000,
-)
+result = wf.run_live(INPUTS, max_tokens=2000)
 ```
 
-This needs `DIFY_API_KEY` for the run, and a console token only if you pass
-`console=` to deploy. Reuse an app when you want its history and logs in Dify;
-use `apps.temporary()` when you want the test to leave nothing behind.
+**Nothing is published.** `run_live()` imports the workflow into a temporary
+app, runs its **draft** — the way the editor's Run button does — and deletes
+the app. Testing a change and releasing it are two acts: this is the first,
+and `console.apps.deploy(wf)` is the second. The console session comes from
+`console=` or, at the moment of the call, from `DIFY_CONSOLE_TOKEN`.
+
+```python
+result = wf.run_live(INPUTS, app_id=APP_ID)   # that app's draft, not a new one
+```
+
+`app_id` runs the draft of an app that exists — where its secret environment
+variables are set, which a temporary app imports blank. Its draft is
+overwritten by this definition; **its published version is not touched**, so
+the app's users keep being served what they were.
+
+A draft run is the console account's, and shows in the app's logs as a
+debugging run. `console.apps.run_draft(app, inputs)` is the same thing without
+the import, for a draft that is already there.
+
+With only `DIFY_API_KEY` (or `api_key=`), `run_live()` runs the app behind that
+key *as published* — that app, not this code. It is how to check a release,
+not how to test a change.
 
 ### The gate
 
@@ -656,8 +671,8 @@ on a test variable being set.
 | Variable | Meaning |
 |---|---|
 | `DIFY_LIVE_TESTS` | this environment may make billed calls |
-| `DIFY_CONSOLE_TOKEN` | create the app the workflow describes, key and all |
-| `DIFY_API_KEY` | run an app that already exists |
+| `DIFY_CONSOLE_TOKEN` | run this definition as a draft, in a temporary app |
+| `DIFY_API_KEY` | run the app behind this key, as published |
 
 Either credential opens the second gate; which one you need depends on the
 path. `DIFY_LIVE_TESTS` is a flag, not a credential:
@@ -756,7 +771,7 @@ wf.depends_on("langgenius/openai:0.3.8@592c8252795b…")
 ```
 
 `wf.missing_plugin_dependencies()` lists what is missing, and `run_live()`
-checks it before deploying, so the failure names the fix.
+checks it before importing anything, so the failure names the fix.
 
 ## Agents as code
 
@@ -1074,6 +1089,189 @@ conventional single output, so `rewrite.output` is `rewrite["text"]`.
 An `answer` node makes the app a chatflow (`advanced-chat`); use `wf.end(...)`
 instead for a plain `workflow` app.
 
+### Edges you do not have to write
+
+A node that reads another node's output has already said it runs after it, so
+those edges are derived from the references:
+
+```python
+wf = Workflow("greeter")
+start = wf.start([text_input("name")])
+greet = wf.template("Hello, {{ n }}!", variables={"n": start["name"]})
+wf.answer(greet)                 # no connect() at all — and it runs
+```
+
+What is left for `wf.connect` is the part no reference implies: which arm of a
+branch to take. Arms name themselves, so the handle is never a typed string,
+and `wf.merge` is the aggregator that rejoins them:
+
+```python
+branch = wf.if_else([when(start["message"], "contains", "urgent")])
+wf.connect(branch.true, escalate)
+wf.connect(branch.false, queue)
+wf.answer(wf.merge(escalate, queue))
+```
+
+Two rules keep the derivation honest, and both were bugs before they were
+rules: a node whose inbound edges were written by hand is left alone (an arm
+that also reads the original message must not get a path that skips the
+branch), and nothing is inferred across a container boundary. `wf.edges` shows
+the whole graph before it is sent.
+
+### Shapes that already work
+
+```python
+from dify_client.workflow import rag_answer
+
+wf = rag_answer(dataset=DATASET_ID, model=MODEL)     # a deployable chatflow
+console.apps.deploy(wf)
+```
+
+`dify_client.workflow.recipes` holds the shapes most apps turn out to be, each
+deployed to a real Dify by a test rather than written in a README:
+`rag_answer` (a whole chatflow), and the fragments `grounded_answer`,
+`extract_fields` and `approval`, which take a workflow and a reference, add
+their nodes and hand back what to read next. The grounding prompt is part of
+the recipe — a model told only to "use the context" answers from memory when
+the context is thin.
+
+### Every node type Dify serves
+
+A typed helper for each, and `wf.add(entity)` for anything configured beyond
+what a helper takes:
+
+| | |
+|---|---|
+| `start` `template` `llm` `code` `tool` `answer` `end` | the everyday ones |
+| `knowledge` | retrieve from knowledge bases |
+| `if_else` `classify` | branch, by condition or by what a model makes of a variable |
+| `http` | call an API, with `bearer` / `basic` / `api_key` auth |
+| `extract_parameters` `extract_text` `list_operator` | pull structured values out of text, files and arrays |
+| `aggregate` `assign` | rejoin branches; write conversation variables |
+| `iteration` `loop` | containers, built with a `with` block |
+| `human_input` | pause for a person, one branch per button |
+| `agent` `dify_agent` `inline_agent` | an agent strategy from a plugin; a published Agent; an Agent shipped inside the workflow |
+| `datasource` `knowledge_index` | where documents come from, and writing chunks back |
+| `webhook` `schedule` `plugin_trigger` | start the workflow without a caller |
+
+A knowledge pipeline is built from the same helpers, minus the ones that are an
+app's: it has no start node, no answer, no trigger, and neither of the agent
+nodes Dify backs with a binding record — `Pipeline` simply does not offer them.
+
+
+```python
+from dify_client.workflow import when
+
+branch = wf.if_else([when(start["message"], "contains", "urgent")])
+hits   = wf.knowledge(start["message"], [DATASET_ID], top_k=3)
+
+with wf.iteration(listing["names"]) as each:
+    greet = wf.template("Hi {{ n }}", variables={"n": each.item})
+    each.returns(greet.output)
+```
+
+`wf.run()` executes the document with graphon, which implements Dify's engine
+but not its server. Nodes whose work *is* the server — knowledge retrieval, a
+form waiting on a person, an agent strategy from a plugin, the triggers — have
+nothing to run locally, and `wf.run()` says so and names the type. Retrieval is
+the one with a stand-in:
+
+```python
+from dify_client.workflow import StubKnowledge
+
+result = wf.run({"q": "refund?"}, knowledge=StubKnowledge(["Refunds take 5 days."]))
+```
+
+### How a knowledge base is searched
+
+Embedding and reranking are settings on the knowledge base, so they decide what
+every later retrieval does — including the one a workflow's knowledge node
+performs:
+
+```python
+from dify_client import retrieval_model
+
+base = knowledge.datasets.create(
+    "handbook",
+    indexing_technique="high_quality",
+    embedding="langgenius/openai/openai:text-embedding-3-small",
+    retrieval=retrieval_model(
+        search="hybrid_search",
+        top_k=5,
+        rerank="langgenius/cohere/cohere:rerank-v3.5",
+    ),
+)
+```
+
+`knowledge.models("text-embedding")` and `console.models.names("rerank")` list
+what a workspace can actually call.
+
+`rerank=` scores results with a model. `weights=weighted_score(embedding=…)` is
+the other mode: it blends the vector and keyword scores arithmetically and
+calls no model. Dify runs one or the other, so passing both is refused here.
+
+A score threshold and the flag that enables it are one setting in Dify's UI and
+two fields on the wire — `retrieval_model(score_threshold=0.2)` sets both, and
+leaving it out turns the filter off. An `economy` base is always searched by
+keyword whatever `search` says, because it has no embeddings.
+
+The same settings configure the knowledge base a pipeline creates:
+
+```python
+pipe.knowledge_index(chunks.output, indexing="high_quality",
+                     embedding=EMBEDDING, rerank=RERANK)
+```
+
+### Knowledge pipelines
+
+A pipeline is a workflow with a different job: documents in, indexed chunks
+out. It starts at a datasource instead of a start node, ends at a knowledge
+base instead of an end node, and Dify serves it from `/rag/pipelines` as its
+own kind of document.
+
+```python
+from dify_client.workflow.recipes import file_pipeline
+
+pipe = file_pipeline(name="support-docs")
+result = console.pipelines.deploy(pipe)     # creates the knowledge base
+print(result.pipeline_id, result.dataset_id)
+```
+
+That is the whole chain Dify's own templates use — a datasource, an extractor,
+a chunker, the knowledge base — and the middle is the part that cannot be
+guessed:
+
+```python
+pipe = Pipeline("support-docs")
+files  = pipe.datasource(plugin_id="langgenius/file", provider="file",
+                         name="upload-file")
+chunks = chunked_text(pipe, files["file"])      # extractor + chunker
+index  = pipe.knowledge_index(chunks["result"])
+pipe.connect(files, chunks, index)
+```
+
+**A knowledge-index node takes chunks, not text.** Wiring an extractor
+straight into it queues the document and then fails *indexing*, after the run
+has already reported success. The extractor and chunker are marketplace
+plugins, so a document carrying them imports and publishes on a workspace that
+does not have them, and the run is what fails.
+
+Everything else between the two ends is ordinary workflow work — the same node
+helpers, edges and ids.
+
+Two ids come back because they address two things: the pipeline holds the
+graph, the knowledge base holds the documents. **Deleting the knowledge base is
+what deletes the pipeline**, and it is named after the pipeline plus a number
+(Dify appends one unconditionally), so find it by `dataset_id` rather than by
+name.
+
+Inputs a pipeline asks for live under `rag`, keyed by the datasource that
+wants them:
+
+```python
+url = pipe.variable(files, "source_url", label="URL")   # {{#rag.<node>.source_url#}}
+```
+
 ### Test it without a Dify server
 
 `StubLLM` stands in for the model, so the rest of the graph — prompt assembly,
@@ -1209,6 +1407,6 @@ unpublishing the app; `enabled=True` puts it back.
 The trigger node types live in Dify's own code, not in graphon, so `wf.run()`
 has no implementation to call and a workflow built around one only runs on a
 real Dify. Test the rest of the graph behind a start node, then swap the trigger
-in for deployment — or run the deployed app with `wf.run_live()`.
+in for deployment with `console.apps.deploy(wf)` and fire it there.
 
 

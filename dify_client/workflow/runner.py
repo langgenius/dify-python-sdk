@@ -97,6 +97,13 @@ def run_dsl(
 #: What to suggest for each family of DSL build failure.
 _BUILD_HINTS: tuple[tuple[str, str], ...] = (
     (
+        "plan.unsupported",
+        "Dify runs that node type itself and graphon carries no implementation "
+        "of it, so it has nothing to run here. A knowledge node takes "
+        "knowledge=StubKnowledge([...]); the rest are testable only on a real "
+        "Dify — deploy the workflow and call run_live().",
+    ),
+    (
         "credential.",
         "Pass credentials=..., or stub the model with "
         "dify_client.workflow.testing.StubLLM to run without one.",

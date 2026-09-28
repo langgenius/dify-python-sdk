@@ -31,6 +31,7 @@ from dify_client import (
 )
 from dify_client.compat import Compatibility, probe
 from dify_client.workflow import Workflow, paragraph, text_input
+from dify_client.workflow.live import LIVE_ENABLED_ENV, live_enabled
 
 #: Every app this harness creates starts with this, so cleanup can find them
 #: even after a crash, and a human can tell them from real work.
@@ -43,6 +44,23 @@ HARNESS_DATASET = f"{HARNESS_PREFIX}-dataset"
 HOST_ENV = "DIFY_HOST"
 EMAIL_ENV = "DIFY_CONSOLE_EMAIL"
 PASSWORD_ENV = "DIFY_CONSOLE_PASSWORD"
+
+
+def billed(test):
+    """Mark a harness test that spends money, and skip it unless asked to.
+
+    Not ``requires_live``: that asks for ``DIFY_CONSOLE_TOKEN`` or
+    ``DIFY_API_KEY``, because a user's own billed test has nothing else to
+    reach Dify with. The harness does — the ``management`` fixture logs in
+    when the test runs — so a token in the environment is never used here,
+    and asking for one only made a run with ``.env`` loaded skip these
+    silently. The one question left is whether spending was agreed to.
+    """
+    reason = (
+        f"{LIVE_ENABLED_ENV} is not set; this test calls real models and costs money"
+    )
+    skip = pytest.mark.skipif(not live_enabled(), reason=reason)
+    return pytest.mark.billed(skip(test))
 
 
 def _configured() -> str | None:

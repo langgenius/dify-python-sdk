@@ -88,7 +88,7 @@ class TestNames:
         from dify_client.workflow import WorkflowError
 
         assert not hasattr(ex, "WorkflowError")
-        assert WorkflowError.__module__ == "dify_client.workflow.builder"
+        assert WorkflowError.__module__ == "dify_client.workflow.parts"
 
     def test_the_exception_nobody_raised_is_gone(self):
         assert not hasattr(ex, "DatasetError")
@@ -101,3 +101,39 @@ class TestNames:
         ]
         assert classes
         assert all(issubclass(c, DifyClientError) for c in classes)
+
+
+class TestEveryRefusalIsOneOfOurs:
+    """A helper shared with the workflow builder raises ``ValueError``, and the
+    knowledge client handed it straight on — so ``except DifyClientError``
+    around a ``datasets.create(...)`` missed the one failure most likely to
+    happen, a mistyped model reference."""
+
+    def client(self):
+        from dify_client import DifyKnowledge
+
+        return DifyKnowledge("dataset-key", base_url="https://dify.test/v1")
+
+    def test_a_model_reference_with_no_model_name_is_a_validation_error(self):
+        from dify_client.exceptions import ValidationError
+
+        with pytest.raises(ValidationError, match="missing a model name"):
+            self.client().datasets.create("handbook", embedding="text-embedding-3")
+
+    def test_it_is_catchable_as_a_client_error(self):
+        with pytest.raises(DifyClientError):
+            self.client().datasets.create("handbook", embedding="text-embedding-3")
+
+    def test_the_async_twin_refuses_the_same_way(self):
+        import asyncio
+
+        from dify_client import AsyncDifyKnowledge
+        from dify_client.exceptions import ValidationError
+
+        async def create():
+            client = AsyncDifyKnowledge("dataset-key", base_url="https://dify.test/v1")
+            async with client:
+                await client.datasets.create("handbook", embedding="text-embedding-3")
+
+        with pytest.raises(ValidationError, match="missing a model name"):
+            asyncio.run(create())

@@ -1,49 +1,37 @@
 """Branching, and asserting which way a run went.
 
-Typed helpers exist for the common nodes; every other node type graphon
-supports goes through ``wf.add()`` with its entity, which is what if-else and
-the variable aggregator use here.
+Three things worth copying:
 
-Two things worth copying:
-
-- Branches are joined by a **variable aggregator**. Without one, an answer that
-  reads from both branches renders the unexecuted branch's reference as literal
-  text, because that variable was never produced.
+- **Only the control flow is wired by hand.** A node that reads another node's
+  output has already said it runs after it, so those edges are derived;
+  ``wf.connect`` is left for the part no reference implies — which arm of the
+  branch to take. ``wf.edges`` shows the whole graph before it is sent.
+- **Branches are joined with** ``wf.merge``, which is Dify's variable
+  aggregator. Without one, an answer that reads from both arms renders the arm
+  that did not run as literal ``{{#…#}}`` text, because that variable was
+  never produced.
 - ``result.nodes`` holds only the nodes that ran, so *which path was taken* is
   something a test can assert directly.
 
     python examples/03_branching.py
 """
 
-from graphon.nodes.if_else.entities import IfElseNodeData
-from graphon.nodes.variable_aggregator.entities import VariableAggregatorNodeData
-from graphon.utils.condition.entities import Condition
-
-from dify_client.workflow import Workflow, paragraph
+from dify_client.workflow import Workflow, paragraph, when
 
 
 def build() -> Workflow:
     wf = Workflow("triage", description="Route a message by urgency.")
     start = wf.start([paragraph("message", label="Message")])
 
-    branch = wf.add(
-        IfElseNodeData(
-            title="Urgent?",
-            cases=[
-                IfElseNodeData.Case(
-                    case_id="urgent",
-                    logical_operator="or",
-                    conditions=[
-                        Condition(
-                            variable_selector=start["message"].selector,
-                            comparison_operator="contains",
-                            value=word,
-                        )
-                        for word in ("urgent", "outage", "down")
-                    ],
-                )
-            ],
-        ),
+    branch = wf.if_else(
+        {
+            "urgent": [
+                when(start["message"], "contains", word)
+                for word in ("urgent", "outage", "down")
+            ]
+        },
+        logical="or",
+        title="Urgent?",
         id="branch",
     )
 
@@ -61,24 +49,13 @@ def build() -> Workflow:
     )
 
     # Whichever branch ran, its output arrives here under one name.
-    merged = wf.add(
-        VariableAggregatorNodeData(
-            title="Merge",
-            output_type="string",
-            variables=[escalate.output.selector, queue.output.selector],
-        ),
-        id="merged",
-    )
+    merged = wf.merge(escalate, queue, title="Merge", id="merged")
+    wf.answer(merged)
 
-    answer = wf.answer(merged["output"])
-
-    wf.connect(start, branch)
-    # The handle is the case id for a matched case, and "false" for the else.
-    wf.connect(branch, escalate, handle="urgent")
-    wf.connect(branch, queue, handle="false")
-    wf.connect(escalate, merged)
-    wf.connect(queue, merged)
-    wf.connect(merged, answer)
+    # The only edges nobody could infer: which arm the branch takes. The arms
+    # name themselves, so the case id is never typed as a string.
+    wf.connect(branch.case("urgent"), escalate)
+    wf.connect(branch.false, queue)
     return wf
 
 

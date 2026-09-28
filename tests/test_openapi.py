@@ -378,3 +378,125 @@ class TestFileUpload:
 
         with pytest.raises(APIError, match="File too large"):
             dify.client().apps.upload_file(APP, pdf)
+
+
+class TestAnImportIsReadTheWayTheConsoleReadsIt:
+    """``/openapi/v1`` raised over a held import, collapsing "Dify is asking"
+    into "Dify said no" — the collapse the console path had already been fixed
+    for. It also had no answer for a lost response, and a string of DSL never
+    reached Dify at all: it was handed to a method that called ``to_yaml()``."""
+
+    IMPORTS = f"/workspaces/{WS}/apps/imports"
+
+    def held(self):
+        return httpx.Response(
+            202,
+            json={
+                "id": "imp-5",
+                "status": "pending",
+                "imported_dsl_version": "0.1.0",
+                "current_dsl_version": "0.7.0",
+            },
+        )
+
+    def test_a_held_import_says_it_is_held(self):
+        result = (
+            Dify(**{self.IMPORTS: self.held()})
+            .client()
+            .apps.import_definition(greeter())
+        )
+
+        assert result.imported is False
+        assert result.needs_confirmation is True
+        assert result.import_id == "imp-5"
+        assert "confirm" in result.error
+
+    def test_a_lost_answer_is_indeterminate(self):
+        def lost(request):
+            raise httpx.ReadTimeout("no answer", request=request)
+
+        dify = Dify()
+        http = httpx.Client(
+            transport=httpx.MockTransport(
+                lambda r: lost(r)
+                if r.url.path.endswith("/apps/imports")
+                else dify.handler(r)
+            ),
+            base_url="https://dify.test/openapi/v1",
+        )
+        client = OpenApiClient(
+            token=TOKEN, base_url="https://dify.test", http_client=http
+        )
+
+        result = client.apps.import_definition(greeter())
+
+        assert result.indeterminate is True
+
+    def test_a_string_of_dsl_is_imported(self):
+        dify = Dify()
+        result = dify.client().apps.import_definition(greeter().to_yaml())
+
+        assert result.imported is True
+        assert dify.bodies[self.IMPORTS]["mode"] == "yaml-content"
+
+    def test_confirming_completes_it(self):
+        confirmed = httpx.Response(
+            200,
+            json={
+                "id": "imp-5",
+                "status": "completed",
+                "app_id": APP,
+                "app_mode": "workflow",
+            },
+        )
+        dify = Dify(**{f"{self.IMPORTS}/imp-5:confirm": confirmed})
+
+        result = dify.client().apps.confirm("imp-5")
+
+        assert result.imported is True
+        assert result.app_id == APP
+        assert result.import_id == "imp-5"
+
+
+class TestConfirmingSaysWhoseAppItIs:
+    """``created`` is what makes deleting the app safe. Confirming a held
+    overwrite reported the caller's existing app as one this session made."""
+
+    IMPORTS = f"/workspaces/{WS}/apps/imports"
+
+    def dify(self):
+        held = httpx.Response(
+            202,
+            json={
+                "id": "imp-7",
+                "status": "pending",
+                "imported_dsl_version": "0.1.0",
+                "current_dsl_version": "0.7.0",
+            },
+        )
+        confirmed = httpx.Response(
+            200,
+            json={
+                "id": "imp-7",
+                "status": "completed",
+                "app_id": APP,
+                "app_mode": "workflow",
+            },
+        )
+        return Dify(**{self.IMPORTS: held, f"{self.IMPORTS}/imp-7:confirm": confirmed})
+
+    def test_a_confirmed_overwrite_is_not_ours(self):
+        client = self.dify().client()
+        held = client.apps.import_definition(greeter(), app_id=APP)
+
+        assert client.apps.confirm(held).created is False
+
+    def test_a_confirmed_new_app_is_ours(self):
+        client = self.dify().client()
+        held = client.apps.import_definition(greeter())
+
+        assert client.apps.confirm(held).created is True
+
+    def test_a_bare_import_id_claims_nothing(self):
+        """There is no telling a new app from an overwrite by id alone."""
+        assert self.dify().client().apps.confirm("imp-7").created is False

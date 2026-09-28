@@ -1,44 +1,45 @@
-"""Build Dify workflows in Python and run them locally.
+"""Dify apps as code: a workflow or a chatflow, built node by node.
 
-The node schemas come from ``graphon``, the same engine Dify runs in
-production, so a workflow built here is validated against the definitions the
-server itself uses rather than against a copy that can drift.
+An app is one of the two documents this package writes. It starts where a
+caller starts it — a start node, or a trigger Dify fires itself — and ends at
+an answer node (a chatflow) or an end node (a workflow), which is what decides
+the app mode. Everything in between is the shared graph, which lives on
+``GraphDocument``.
+
+The other document built on that graph is a knowledge pipeline, in
+``dify_client.workflow.pipeline``.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
-from pathlib import Path
+from collections.abc import Mapping, Sequence
 from typing import Any, cast
 from uuid import uuid4
 
-import yaml
-from graphon.entities.base_node_data import BaseNodeData
 from graphon.nodes.answer.entities import AnswerNodeData
 from graphon.nodes.base.entities import OutputVariableEntity
-from graphon.nodes.code.entities import CodeNodeData
 from graphon.nodes.end.entities import EndNodeData
-from graphon.nodes.llm.entities import (
-    ContextConfig,
-    LLMNodeChatModelMessage,
-    LLMNodeData,
-    ModelConfig,
-)
 from graphon.nodes.start.entities import StartNodeData
-from graphon.nodes.template_transform.entities import TemplateTransformNodeData
 from graphon.variables.input_entities import VariableEntity
 
+from ..agent import AgentError
 from ..lifecycle import Stage
-from .layout import assign_positions
-from .refs import Node, Text, VarRef, render
-from .results import RunResult
-from .triggers import (
-    FREQUENCIES,
+from .graph import GraphDocument
+from .nodes import (
+    NodeInput,
     ScheduleTriggerData,
+    TriggerEventNodeData,
     WebhookMethod,
     WebhookParameter,
     WebhookTriggerData,
+    agents,
 )
+from .nodes.triggers import FREQUENCIES
+from .parts import ROOT_NODE_TYPES, WorkflowError, _claim_name, _node_rules
+from .refs import Node, Ref, Text, VarRef, reference, render
+from .results import RunResult
+
+__all__ = ["DSL_VERSION", "WORKFLOW_MODES", "ConversationVar", "Workflow"]
 
 #: The Dify app DSL version this builder emits.
 DSL_VERSION = "0.7.0"
@@ -48,79 +49,109 @@ WORKFLOW_MODES = frozenset({"workflow", "advanced-chat"})
 
 _CHAT_MODES = frozenset({"advanced-chat"})
 
-#: Node types a graph may begin at. Dify treats each as a root.
-ROOT_NODE_TYPES = frozenset(
-    {"start", "datasource", "trigger-webhook", "trigger-schedule", "trigger-plugin"}
+#: Said in two places, because the mode can be known when the variable is
+#: declared or only once the document is finished.
+_NO_CONVERSATION = (
+    "A {mode!r} app has no conversation to keep {name!r} on, and Dify drops "
+    "conversation variables it imports into one. Answer with wf.answer(...) "
+    "to make this a chatflow, or use an environment variable instead."
 )
 
 
-class WorkflowError(Exception):
-    """Raised when a workflow is built in a way Dify would reject."""
+class ConversationVar:
+    """A variable that survives from one message of a chatflow to the next.
 
-
-class EnvVar:
-    """A workflow environment variable.
-
-    Marking one ``secret`` keeps its value out of the exported DSL, the same
-    way Dify's own export blanks ``SecretVariable`` values unless the caller
-    explicitly asks for them. The value is still used by local runs, which
-    never touch the disk.
+    Environment variables are settings; conversation variables are memory.
+    Only ``wf.assign(...)`` writes one, and only a chatflow has a conversation
+    for them to live in.
     """
 
-    __slots__ = ("name", "value", "secret", "description", "id")
+    __slots__ = ("name", "value", "type", "description", "id")
 
     def __init__(
         self,
         name: str,
         value: Any = "",
         *,
-        secret: bool = False,
+        type: str = "string",
         description: str = "",
         id: str | None = None,
     ):
         self.name = name
         self.value = value
-        self.secret = secret
+        self.type = type
         self.description = description
         self.id = id or str(uuid4())
 
-    @property
-    def value_type(self) -> str:
-        if self.secret:
-            return "secret"
-        if isinstance(self.value, bool):
-            return "string"
-        if isinstance(self.value, (int, float)):
-            return "number"
-        return "string"
-
-    def to_dsl(self, *, include_secret: bool) -> dict[str, Any]:
+    def to_dsl(self) -> dict[str, Any]:
         return {
             "id": self.id,
             "name": self.name,
+            "value_type": self.type,
+            "value": self.value,
             "description": self.description,
-            "value_type": self.value_type,
-            "value": self.value if include_secret or not self.secret else "",
+            "selector": ["conversation", self.name],
         }
 
     def __repr__(self) -> str:
-        shown = "<secret>" if self.secret else repr(self.value)
-        return f"EnvVar({self.name!r}, {shown})"
+        return f"ConversationVar({self.name!r}, {self.value!r}, type={self.type!r})"
 
 
-class Edge:
-    """A connection between two nodes."""
+def _packaged(ref: str, agent: Any, *, include_secret: bool) -> dict[str, Any]:
+    """One inline Agent, refused in the document's own vocabulary.
 
-    __slots__ = ("source", "target", "source_handle")
+    An Agent knows what Dify will not accept from it; it does not know which
+    node bound it. A workflow carrying several says which one is wrong, since
+    the field an empty Agent is missing is the name you would call it by.
+    """
+    try:
+        return cast(dict[str, Any], agent.to_package(include_secret=include_secret))
+    except AgentError as refusal:
+        msg = (
+            f"The agent bound to this workflow as {ref!r} cannot be shipped: {refusal}"
+        )
+        raise WorkflowError(msg) from refusal
 
-    def __init__(self, source: str, target: str, source_handle: str = "source"):
-        self.source = source
-        self.target = target
-        self.source_handle = source_handle
+
+def _live_console(console: Any, *, api_key: Any, app_id: str | None) -> Any:
+    """The console session a live run drafts through, or None to run by key.
+
+    Resolved when the run is asked for rather than beforehand: a console
+    passed in, else one from ``DIFY_CONSOLE_TOKEN``. An app key is the other
+    route, and says so by being given — or by being the only credential set.
+    """
+    import os
+
+    from ..console import CONSOLE_TOKEN_ENV, DifyManagement
+    from ..secrets import API_KEY_ENV
+    from .live import LiveRunError
+
+    if console is not None:
+        return console
+    if api_key is not None:
+        if app_id:
+            msg = (
+                "app_id names an app to import this definition into, which "
+                "needs a console session, and api_key= runs an app as "
+                "published. Pass console= (or set DIFY_CONSOLE_TOKEN), or "
+                "drop app_id."
+            )
+            raise LiveRunError(msg)
+        return None
+    if os.environ.get(CONSOLE_TOKEN_ENV):
+        return DifyManagement()
+    if os.environ.get(API_KEY_ENV) and not app_id:
+        return None
+    msg = (
+        f"A live run needs a way into Dify. Set {CONSOLE_TOKEN_ENV} (or pass "
+        "console=DifyManagement(...)) to run this definition as a draft, or "
+        f"{API_KEY_ENV} to run the app behind that key as published."
+    )
+    raise LiveRunError(msg)
 
 
-class Workflow:
-    """A Dify workflow defined in code.
+class Workflow(GraphDocument):
+    """A Dify app defined in code.
 
     Example::
 
@@ -132,6 +163,10 @@ class Workflow:
 
         wf.to_yaml("greeter.yml")        # import this into Dify
         wf.run({"name": "Dify"})         # or run it right here
+
+    The node helpers live on ``GraphDocument``, which a knowledge pipeline
+    shares. What an app adds is how it starts and ends, the conversation
+    variables a chatflow keeps, and running it.
     """
 
     def __init__(
@@ -140,25 +175,18 @@ class Workflow:
         *,
         description: str = "",
         mode: str | None = None,
-        icon: str = "\U0001f916",
+        icon: str = "🤖",
         icon_background: str = "#FFEAD5",
     ):
-        self.name = name
-        self.description = description
-        self.icon = icon
-        self.icon_background = icon_background
+        super().__init__(
+            name,
+            description=description,
+            icon=icon,
+            icon_background=icon_background,
+        )
         self._mode = mode
-        self._nodes: list[Node] = []
-        self._edges: list[Edge] = []
-        self._ids: set[str] = set()
-        self._dependencies: list[dict[str, Any]] = []
-        self._env_vars: list[EnvVar] = []
-
-    # -- structure ---------------------------------------------------------
-
-    @property
-    def nodes(self) -> list[Node]:
-        return list(self._nodes)
+        #: Inline Agents this document ships, by the ref their nodes bind to.
+        self._agent_packages: dict[str, Any] = {}
 
     @property
     def mode(self) -> str:
@@ -168,68 +196,49 @@ class Workflow:
         has_answer = any(n.type == "answer" for n in self._nodes)
         return "advanced-chat" if has_answer else "workflow"
 
-    def add(self, data: BaseNodeData, *, id: str | None = None) -> Node:
-        """Add any graphon node entity to the workflow.
-
-        Every node type graphon supports is usable through this method, which
-        is what the typed helpers below call. Reach for it directly when a node
-        has no dedicated helper yet::
-
-            from graphon.nodes.if_else.entities import IfElseNodeData
-            branch = wf.add(IfElseNodeData(title="Branch", cases=[...]))
-        """
-        node_id = self._claim_id(id, data)
-        node = Node(id=node_id, data=data)
-        self._nodes.append(node)
-        return node
-
-    def connect(self, *nodes: Node, handle: str = "source") -> None:
-        """Connect nodes in sequence: ``connect(a, b, c)`` links a→b→c.
-
-        ``handle`` names the source branch for nodes that fan out, such as the
-        case id of an if-else branch.
-        """
-        if len(nodes) < 2:
-            msg = "connect() needs at least two nodes."
-            raise WorkflowError(msg)
-        for source, target in zip(nodes, nodes[1:], strict=False):
-            self._edges.append(Edge(source.id, target.id, handle))
-
-    def env_var(
+    def conversation_var(
         self,
         name: str,
         value: Any = "",
         *,
-        secret: bool = False,
+        type: str = "string",
         description: str = "",
     ) -> VarRef:
-        """Declare an environment variable, referenced as ``{{#env.NAME#}}``.
+        """Declare a conversation variable, referenced as ``{{#conversation.NAME#}}``.
 
-        ``secret=True`` keeps the value out of ``to_yaml()`` so the exported
-        DSL stays safe to commit, while local runs still see it.
+        It keeps its value across the messages of one conversation, which is
+        what gives a chatflow memory beyond the model's context::
+
+            history = wf.conversation_var("seen", [], type="array[string]")
+            wf.assign([(history, "append", start["q"])])
+
+        Dify stores these on the conversation, so a ``workflow`` app has
+        nowhere to put them — declare them on a chatflow. A document whose
+        mode has not been fixed yet is checked when it is rendered instead,
+        because an app becomes a chatflow at ``wf.answer(...)``, which is
+        usually written after the variables it reads.
         """
-        if any(existing.name == name for existing in self._env_vars):
-            msg = f"Environment variable {name!r} is already declared."
-            raise WorkflowError(msg)
-        self._env_vars.append(
-            EnvVar(name, value, secret=secret, description=description)
+        if self._mode is not None and self._mode not in _CHAT_MODES:
+            raise WorkflowError(_NO_CONVERSATION.format(mode=self._mode, name=name))
+        _claim_name(
+            (existing.name for existing in self._conversation_vars),
+            name,
+            "Conversation variable",
         )
-        return VarRef("env", name)
+        if value is None:
+            msg = (
+                f"Conversation variable {name!r} needs a starting value; Dify "
+                "rejects one without. Use '' for a string, [] for an array."
+            )
+            raise WorkflowError(msg)
+        self._conversation_vars.append(
+            ConversationVar(name, value, type=type, description=description)
+        )
+        return VarRef("conversation", name)
 
     @property
-    def env_vars(self) -> list[EnvVar]:
-        return list(self._env_vars)
-
-    def depends_on(self, plugin_identifier: str, *, kind: str = "marketplace") -> None:
-        """Declare a plugin this workflow needs, so Dify installs it on import."""
-        self._dependencies.append(
-            {
-                "type": kind,
-                "value": {"marketplace_plugin_unique_identifier": plugin_identifier},
-            }
-        )
-
-    # -- typed node helpers ------------------------------------------------
+    def conversation_vars(self) -> list[ConversationVar]:
+        return list(self._conversation_vars)
 
     def start(
         self,
@@ -240,197 +249,6 @@ class Workflow:
     ) -> Node:
         """The entry point, declaring the workflow's input variables."""
         return self.add(StartNodeData(title=title, variables=list(inputs)), id=id)
-
-    def template(
-        self,
-        template: str,
-        *,
-        variables: Mapping[str, VarRef] | None = None,
-        title: str = "Template",
-        id: str | None = None,
-    ) -> Node:
-        """A Jinja2 template node. Runs locally with no external services."""
-        data = TemplateTransformNodeData(
-            title=title,
-            template=template,
-            variables=[
-                {"variable": name, "value_selector": ref.selector}
-                for name, ref in (variables or {}).items()
-            ],
-        )
-        return self.add(data, id=id)
-
-    def llm(
-        self,
-        prompt: Text | Sequence[tuple[str, Text]],
-        *,
-        model: str,
-        title: str = "LLM",
-        id: str | None = None,
-        completion_params: Mapping[str, Any] | None = None,
-        mode: str = "chat",
-    ) -> Node:
-        """An LLM node.
-
-        ``prompt`` is either the text of a single user message or a sequence of
-        ``(role, text)`` pairs. Either form accepts variable references, so the
-        prompt can be assembled from upstream nodes.
-
-        ``model`` is the fully qualified Dify model reference,
-        ``provider/plugin/model``, for example
-        ``langgenius/openai/openai:gpt-4o-mini``.
-        """
-        provider, _, model_name = model.rpartition(":")
-        if not provider:
-            msg = (
-                f"model={model!r} is missing a model name. "
-                "Use 'provider/plugin/name:model', "
-                "e.g. 'langgenius/openai/openai:gpt-4o-mini'."
-            )
-            raise WorkflowError(msg)
-        if isinstance(prompt, (str, VarRef)):
-            messages: list[tuple[str, Text]] = [("user", prompt)]
-        else:
-            messages = list(prompt)
-        data = LLMNodeData(
-            title=title,
-            model=ModelConfig(
-                provider=provider,
-                name=model_name,
-                mode=mode,
-                completion_params=dict(completion_params or {}),
-            ),
-            prompt_template=[
-                LLMNodeChatModelMessage(role=role, text=render(text))
-                for role, text in messages
-            ],
-            context=ContextConfig(enabled=False),
-        )
-        return self.add(data, id=id)
-
-    def code(
-        self,
-        code: str,
-        *,
-        variables: Mapping[str, VarRef] | None = None,
-        outputs: Mapping[str, str] | None = None,
-        language: str = "python3",
-        title: str = "Code",
-        id: str | None = None,
-    ) -> Node:
-        """A code node. Needs a sandbox to run; see ``run(code_executor=...)``."""
-        data = CodeNodeData(
-            title=title,
-            code=code,
-            code_language=language,
-            variables=[
-                {"variable": name, "value_selector": ref.selector}
-                for name, ref in (variables or {}).items()
-            ],
-            outputs={name: {"type": type_} for name, type_ in (outputs or {}).items()},
-        )
-        return self.add(data, id=id)
-
-    def tool(
-        self,
-        spec: Any,
-        config: Mapping[str, Any] | None = None,
-        params: Mapping[str, Any] | None = None,
-        *,
-        title: str | None = None,
-        id: str | None = None,
-    ) -> Node:
-        """Add a tool node from a spec discovered on the workspace.
-
-        ``spec`` comes from ``DifyManagement.tools.catalog()``; it carries the
-        identifiers a tool node needs and, crucially, which parameters are
-        configured now and which are supplied per run. Passing one as the other
-        produces a node Dify accepts and cannot run, so they are separate
-        arguments and a misplaced name is rejected here::
-
-            catalog = console.tools.catalog()
-            now = wf.tool(catalog["time"]["current_time"],
-                          config={"timezone": "Asia/Tokyo"})
-            page = wf.tool(catalog["webscraper"]["webscraper"],
-                           params={"url": start["url"]})
-
-        A ``params`` value may be a reference to another node, in which case it
-        becomes a variable input rather than a constant. The tool's plugin is
-        declared automatically, so the deployed app has what it needs.
-        """
-        from graphon.nodes.tool.entities import ToolNodeData
-
-        config = dict(config or {})
-        params = dict(params or {})
-        self._check_tool_arguments(spec, config, params)
-
-        data = ToolNodeData(
-            title=title or getattr(spec, "label", None) or spec.name,
-            provider_id=spec.provider_id,
-            provider_type=spec.provider_type,
-            provider_name=spec.provider_name,
-            tool_name=spec.name,
-            tool_label=getattr(spec, "label", None) or spec.name,
-            tool_configurations=config,
-            tool_parameters={
-                name: _tool_input(value) for name, value in params.items()
-            },
-            plugin_unique_identifier=getattr(spec, "plugin_unique_identifier", None),
-        )
-        node = self.add(data, id=id)
-        identifier = getattr(spec, "plugin_unique_identifier", None)
-        if identifier:
-            self.depends_on(identifier)
-        return node
-
-    def _check_tool_arguments(
-        self,
-        spec: Any,
-        config: Mapping[str, Any],
-        params: Mapping[str, Any],
-    ) -> None:
-        """Reject names the tool does not have, or that belong on the other side."""
-        known = {p.name: p for p in getattr(spec, "parameters", ())}
-        if not known:
-            return
-
-        for group, names, expected in (
-            ("config", config, True),
-            ("params", params, False),
-        ):
-            for name in names:
-                parameter = known.get(name)
-                if parameter is None:
-                    available = ", ".join(sorted(known)) or "none"
-                    msg = (
-                        f"{spec.name!r} has no parameter {name!r}. "
-                        f"It takes: {available}."
-                    )
-                    raise WorkflowError(msg)
-                if parameter.is_configuration is not expected:
-                    other = "params" if expected else "config"
-                    kind = "supplied per run" if expected else "configured when built"
-                    msg = (
-                        f"{name!r} is {kind}, so it belongs in {other}=, not "
-                        f"{group}=. Dify accepts the node either way and then "
-                        "cannot run it."
-                    )
-                    raise WorkflowError(msg)
-
-        missing = [
-            name
-            for name, parameter in known.items()
-            if parameter.required
-            and parameter.is_configuration
-            and name not in config
-            and parameter.default is None
-        ]
-        if missing:
-            msg = (
-                f"{spec.name!r} needs {', '.join(sorted(missing))} in config=, "
-                "and the tool declares no default."
-            )
-            raise WorkflowError(msg)
 
     def answer(
         self,
@@ -444,7 +262,7 @@ class Workflow:
 
     def end(
         self,
-        outputs: Mapping[str, VarRef] | None = None,
+        outputs: Mapping[str, Ref] | None = None,
         *,
         title: str = "End",
         id: str | None = None,
@@ -453,7 +271,10 @@ class Workflow:
         data = EndNodeData(
             title=title,
             outputs=[
-                OutputVariableEntity(variable=name, value_selector=ref.selector)
+                OutputVariableEntity(
+                    variable=name,
+                    value_selector=reference(ref, f"outputs[{name!r}]").selector,
+                )
                 for name, ref in (outputs or {}).items()
             ],
         )
@@ -543,7 +364,125 @@ class Workflow:
         )
         return self.add(data, id=id)
 
-    # -- serialisation -----------------------------------------------------
+    def plugin_trigger(
+        self,
+        *,
+        plugin_id: str,
+        provider_id: str,
+        event: str,
+        subscription_id: str,
+        plugin_unique_identifier: str,
+        parameters: Mapping[str, Any] | None = None,
+        title: str = "Trigger",
+        id: str | None = None,
+    ) -> Node:
+        """Start the workflow when a plugin reports an event.
+
+        Takes the place of a start node, like ``wf.webhook()``. The plugin and
+        the subscription both exist on the server first — Dify mints the
+        subscription when the trigger is configured — so every id here is read
+        back from it rather than chosen.
+        """
+        data = TriggerEventNodeData(
+            title=title,
+            plugin_id=plugin_id,
+            provider_id=provider_id,
+            event_name=event,
+            subscription_id=subscription_id,
+            plugin_unique_identifier=plugin_unique_identifier,
+            event_parameters={
+                key: NodeInput(value=value, type="constant")
+                for key, value in (parameters or {}).items()
+            },
+        )
+        return self.add(data, id=id)
+
+    # -- agents that Dify binds to a record -------------------------------
+    #
+    # Both of these name an Agent through a binding Dify turns into a row while
+    # it imports the draft, and only the app importer does that: a pipeline
+    # imports the same document, publishes it, and drops `agent_packages` on
+    # the way — leaving a node bound to a package that is not there. So they
+    # are an app's, and a pipeline keeps `agent()`, whose strategy needs no
+    # binding.
+
+    def dify_agent(
+        self,
+        agent: Any,
+        task: str = "",
+        *,
+        outputs: Sequence[Mapping[str, Any]] = (),
+        title: str = "Agent",
+        id: str | None = None,
+    ) -> Node:
+        """An agent node that runs one of the workspace's published Agents.
+
+        ``agent`` is a roster Agent id, or anything carrying one — what
+        ``DifyManagement.agents.list()`` returns::
+
+            triage = console.agents.retrieve("support-triage")
+            node = wf.dify_agent(triage, "Decide whether this pages someone.",
+                                 outputs=[declared_output("severity")])
+
+        The Agent is **shared**: other workflows may bind the same one, and
+        publishing a new version of it changes what they all run. To ship an
+        Agent that belongs to this workflow alone, use ``wf.inline_agent()``.
+
+        Dify turns the binding into a record while it imports the draft, and
+        the Agent must be published and callable from a workflow by then —
+        an unpublished one fails the import with "references an unavailable or
+        unpublished roster agent".
+        """
+        with _node_rules():
+            data = agents.roster_data(
+                agent_id=agent if isinstance(agent, str) else getattr(agent, "id", ""),
+                task=task,
+                outputs=outputs,
+                title=title,
+            )
+        return self.add(data, id=id)
+
+    def inline_agent(
+        self,
+        agent: Any,
+        task: str = "",
+        *,
+        outputs: Sequence[Mapping[str, Any]] = (),
+        title: str = "Agent",
+        id: str | None = None,
+    ) -> Node:
+        """An agent node that carries its own Agent inside the workflow.
+
+        ``agent`` is a :class:`dify_client.agent.Agent` — the same object
+        ``Agent.create(...)`` and ``Agent.from_yaml(...)`` produce — and it is
+        exported with the workflow under ``agent_packages``::
+
+            researcher = Agent.create("researcher", instruction="…", model=MODEL)
+            node = wf.inline_agent(researcher, "Summarise what you find.")
+
+        Dify creates an Agent owned by this node on import, so the document is
+        self-contained: nothing outside it can change what this node runs, and
+        deploying the workflow elsewhere takes the Agent along. The trade is
+        that it is not the workspace's Agent — edits in the roster do not reach
+        it, and it does not appear on the roster.
+        """
+        package = getattr(agent, "to_package", None)
+        if package is None:
+            msg = (
+                "inline_agent() takes a dify_client.agent.Agent, which carries "
+                "the soul to ship. For an Agent the workspace already has, use "
+                "wf.dify_agent(agent_id)."
+            )
+            raise WorkflowError(msg)
+        ref = f"agent_{len(self._agent_packages) + 1}"
+        # Kept unblanked here and blanked by to_dict() unless the caller asks
+        # for secrets, the same way an environment variable is.
+        self._agent_packages[ref] = agent
+        with _node_rules():
+            data = agents.packaged_data(
+                package_ref=ref, task=task, outputs=outputs, title=title
+            )
+        return self.add(data, id=id)
 
     def to_dict(self, *, include_secret: bool = False) -> dict[str, Any]:
         """Render the workflow as a Dify app DSL document.
@@ -552,11 +491,6 @@ class Workflow:
         set, so the default output is safe to write to a file and commit.
         """
         self.validate()
-        positions = assign_positions(
-            [n.id for n in self._nodes],
-            [(e.source, e.target) for e in self._edges],
-        )
-        types = {n.id: n.type for n in self._nodes}
         document: dict[str, Any] = {
             "app": {
                 "name": self.name,
@@ -569,69 +503,19 @@ class Workflow:
             },
             "kind": "app",
             "version": DSL_VERSION,
-            "workflow": {
-                "graph": {
-                    "nodes": [
-                        {
-                            "id": node.id,
-                            "type": "custom",
-                            "position": positions[node.id],
-                            "data": node.data.model_dump(
-                                mode="json", exclude_none=True
-                            ),
-                        }
-                        for node in self._nodes
-                    ],
-                    "edges": [
-                        {
-                            "id": f"{edge.source}-{edge.source_handle}-{edge.target}",
-                            "source": edge.source,
-                            "target": edge.target,
-                            "sourceHandle": edge.source_handle,
-                            "targetHandle": "target",
-                            "type": "custom",
-                            "data": {
-                                "sourceType": types[edge.source],
-                                "targetType": types[edge.target],
-                                "isInIteration": False,
-                            },
-                        }
-                        for edge in self._edges
-                    ],
-                    "viewport": {"x": 0, "y": 0, "zoom": 1},
-                },
-                "features": {},
-                "environment_variables": [
-                    var.to_dsl(include_secret=include_secret) for var in self._env_vars
-                ],
-                "conversation_variables": [],
-            },
+            "workflow": self._workflow_section(include_secret=include_secret),
         }
         if self._dependencies:
             document["dependencies"] = self._dependencies
+        if self._agent_packages:
+            # An inline Agent travels with the workflow: Dify reads these while
+            # importing the draft and creates an Agent owned by the node whose
+            # binding names the ref.
+            document["agent_packages"] = {
+                ref: _packaged(ref, agent, include_secret=include_secret)
+                for ref, agent in self._agent_packages.items()
+            }
         return document
-
-    def to_yaml(
-        self,
-        path: str | Path | None = None,
-        *,
-        include_secret: bool = False,
-    ) -> str:
-        """Render the DSL as YAML, optionally writing it to ``path``.
-
-        Secret environment variables are blanked by default. Only pass
-        ``include_secret=True`` for output that is going somewhere as guarded
-        as the secrets themselves.
-        """
-        text = yaml.safe_dump(
-            self.to_dict(include_secret=include_secret),
-            allow_unicode=True,
-            sort_keys=False,
-            default_flow_style=False,
-        )
-        if path is not None:
-            Path(path).write_text(text, encoding="utf-8")
-        return text
 
     def validate(self) -> None:
         """Check the structure Dify requires, raising ``WorkflowError``."""
@@ -654,6 +538,12 @@ class Workflow:
             accepted = ", ".join(sorted(WORKFLOW_MODES))
             msg = f"mode={self.mode!r} is not importable as a workflow. Use one of: {accepted}."
             raise WorkflowError(msg)
+        if self._conversation_vars and self.mode not in _CHAT_MODES:
+            raise WorkflowError(
+                _NO_CONVERSATION.format(
+                    mode=self.mode, name=self._conversation_vars[0].name
+                )
+            )
         terminal = "answer" if self.mode in _CHAT_MODES else "end"
         if not any(n.type == terminal for n in self._nodes):
             msg = (
@@ -661,16 +551,20 @@ class Workflow:
                 f"Add one with wf.{terminal}(...)."
             )
             raise WorkflowError(msg)
-        connected = {e.source for e in self._edges} | {e.target for e in self._edges}
+        edges = self.edges
+        connected = {e.source for e in edges} | {e.target for e in edges}
         orphans = [n.id for n in self._nodes if n.id not in connected]
         if orphans and len(self._nodes) > 1:
             msg = (
                 f"These nodes are not connected to anything: {', '.join(orphans)}. "
-                "Link them with wf.connect(...)."
+                "A node that reads another node's output is connected by that "
+                f"alone; one that reads nothing needs wf.connect(...)."
             )
             raise WorkflowError(msg)
-
-    # -- local execution ---------------------------------------------------
+        # A read of a branch names the arm to choose, which says more than
+        # "nothing leads here" about the same node, so it is asked first.
+        self._check_references_are_reachable()
+        self._check_every_node_is_entered()
 
     def run(
         self,
@@ -679,6 +573,7 @@ class Workflow:
         credentials: Mapping[str, Any] | str | None = None,
         llm: Any = None,
         code: Any = None,
+        knowledge: Any = None,
         workflow_id: str | None = None,
         raise_on_error: bool = False,
     ) -> RunResult:
@@ -690,6 +585,9 @@ class Workflow:
         Pass ``code=LocalSandbox()`` to run code nodes on this machine instead
         of reaching for Dify's sandbox service, or ``code=StubCode({...})`` to
         answer them without running anything.
+
+        Pass ``knowledge=StubKnowledge([...])`` to answer knowledge nodes,
+        which graphon cannot run at all: retrieval lives in the server.
         """
         from contextlib import ExitStack
 
@@ -709,6 +607,10 @@ class Workflow:
                 from .sandbox import code_executor
 
                 stack.enter_context(code_executor(code))
+            if knowledge is not None:
+                from .local_knowledge import knowledge_retriever
+
+                stack.enter_context(knowledge_retriever(knowledge))
             result = run_dsl(
                 dsl,
                 inputs=inputs,
@@ -734,37 +636,37 @@ class Workflow:
     ) -> RunResult:
         """Run this workflow on a real Dify instance. **This costs money.**
 
-        Unlike ``run(llm=StubLLM(...))``, which is free and offline, this calls
-        the app in Dify — the same engine, plugins, credentials and version
-        that serve production. It proceeds only when ``DIFY_LIVE_TESTS`` is
-        set, so a stray call in a test suite cannot start spending.
+        Unlike ``run(llm=StubLLM(...))``, which is free and offline, this runs
+        in Dify — the same engine, plugins and credentials that serve
+        production. It proceeds only when ``DIFY_LIVE_TESTS`` is set, so a
+        stray call in a test suite cannot start spending.
 
-        Pass ``console`` (a ``DifyManagement``) and ``app_id`` to deploy this
-        workflow over that app first. Doing so is what keeps the test about
-        *this code* rather than about whatever the app in Dify has drifted
-        into::
+        **Nothing is published.** The workflow is imported into a temporary
+        app, its draft is run the way the editor's Run button runs it, and the
+        app is deleted. Testing a definition and releasing it are two acts;
+        this is the first, and ``console.apps.deploy(wf)`` is the second::
 
-            result = wf.run_live(
-                {"q": "hello"},
-                console=ConsoleClient(), app_id=APP_ID,
-                max_tokens=2000,
-            )
+            result = wf.run_live({"q": "hello"}, max_tokens=2000)
             assert result.node("prompt")["output"].startswith("Summarise")
 
-        A chatflow — anything with an answer node — is driven by a message, so
-        pass ``query=``; it arrives as ``sys.query``. A ``workflow`` app runs on
-        ``inputs`` alone. The Service API serves the two at different paths and
-        rejects the wrong one, so the route follows ``self.mode``.
+        The console session comes from ``console=`` or, when that is left
+        out, from ``DIFY_CONSOLE_TOKEN`` at the moment of the call.
 
-        The result has the same shape a local run produces, so assertions carry
-        across unchanged.
+        ``app_id`` runs the draft of an app that already exists instead —
+        where its secret environment variables are set, which a temporary app
+        imports blank. Its **draft** is overwritten by this definition; its
+        published version is not touched.
+
+        ``api_key`` (or ``DIFY_API_KEY``, with no console token) is the other
+        way in: it runs the app behind that key, as published, which is *that
+        app* rather than this code — useful to check a release, not to test a
+        change.
+
+        A chatflow — anything with an answer node — is driven by a message, so
+        pass ``query=``; it arrives as ``sys.query``. The result has the same
+        shape a local run produces, so assertions carry across unchanged.
         """
-        from .live import (
-            LIVE_ENABLED_ENV,
-            LiveRunError,
-            check_budget,
-            live_enabled,
-        )
+        from .live import LIVE_ENABLED_ENV, LiveRunError, check_budget, live_enabled
 
         if not live_enabled():
             msg = (
@@ -774,105 +676,84 @@ class Workflow:
             )
             raise LiveRunError(msg)
 
+        console = _live_console(console, api_key=api_key, app_id=app_id)
         if console is not None:
-            if not app_id:
-                msg = (
-                    "Deploying needs app_id: which app in Dify to overwrite. "
-                    "Create the app once, then pass its id so every run tests "
-                    "the workflow this code defines."
-                )
-                raise LiveRunError(msg)
-            missing = self.missing_plugin_dependencies()
-            if missing:
-                names = ", ".join(missing)
-                msg = (
-                    f"This workflow uses {names} but declares no plugin for it, "
-                    "so Dify would import an app it cannot run. Declare it with "
-                    'wf.depends_on("<plugin>:<version>@<hash>") — the identifier '
-                    "is on the plugin's Dify Marketplace page."
-                )
-                raise LiveRunError(msg)
-            # Importing a DSL writes a draft; the Service API runs the
-            # published version. Deploying does both and reports which step it
-            # reached, so a publish that failed is not mistaken for a run of
-            # the wrong version.
-            console.apps.deploy(self, app_id=app_id, key=False).raise_for_stage(
-                Stage.PUBLISHED
+            result = self._run_draft_on(
+                console,
+                inputs,
+                app_id=app_id,
+                query=query,
+                conversation_id=conversation_id,
             )
-        elif app_id:
-            msg = "app_id was given without console=..., so there is nothing to deploy with."
-            raise LiveRunError(msg)
+        else:
+            from .dify_runner import run_on_dify
 
-        from .dify_runner import run_on_dify
-
-        result = run_on_dify(
-            inputs,
-            api_key=api_key,
-            base_url=base_url,
-            mode=self.mode,
-            query=query,
-            conversation_id=conversation_id,
-            user=user,
-        )
+            result = run_on_dify(
+                inputs,
+                api_key=api_key,
+                base_url=base_url,
+                mode=self.mode,
+                query=query,
+                conversation_id=conversation_id,
+                user=user,
+            )
         if raise_on_error:
             result.raise_for_status()
         return check_budget(result, max_cost, max_tokens)
 
-    def missing_plugin_dependencies(self) -> list[str]:
-        """Model providers this workflow uses but never declared a plugin for.
+    def _run_draft_on(
+        self,
+        console: Any,
+        inputs: Mapping[str, Any] | None,
+        *,
+        app_id: str | None,
+        query: str | None,
+        conversation_id: str | None,
+    ) -> RunResult:
+        """Import this definition as a draft and run it, publishing nothing."""
+        from .live import LiveRunError
 
-        Dify installs a workflow's declared plugins when it imports the DSL, so
-        an undeclared provider deploys into an app that cannot run.
-        """
-        declared = {
-            str(dep.get("value", {}).get("marketplace_plugin_unique_identifier", ""))
-            for dep in self._dependencies
-        }
-        missing: list[str] = []
-        for node in self._nodes:
-            provider = getattr(getattr(node.data, "model", None), "provider", "")
-            if not provider:
-                continue
-            plugin = "/".join(str(provider).split("/")[:2])
-            if not any(name.startswith(f"{plugin}:") for name in declared):
-                if plugin not in missing:
-                    missing.append(plugin)
-        return missing
+        missing = self.missing_plugin_dependencies()
+        if missing:
+            names = ", ".join(missing)
+            msg = (
+                f"This workflow uses {names} but declares no plugin for it, "
+                "so Dify would import an app it cannot run. Declare it with "
+                'wf.depends_on("<plugin>:<version>@<hash>") — the identifier '
+                "is on the plugin's Dify Marketplace page."
+            )
+            raise LiveRunError(msg)
 
-    # -- internals ---------------------------------------------------------
+        name = None if app_id else f"{self.name}-run-live-{uuid4().hex[:6]}"
+        draft = console.apps.import_definition(self, app_id=app_id, name=name)
+        if draft.indeterminate and name:
+            # The import may have created the temporary app, and no id came
+            # back to delete it by. Its name is this run's alone, so it is
+            # found that way rather than left in the workspace unreported.
+            from ..resources.management import _sweep_named
 
-    def _claim_id(self, requested: str | None, data: BaseNodeData) -> str:
-        base = requested or str(data.type).replace("-", "_")
-        if requested is not None and requested in self._ids:
-            msg = f"Node id {requested!r} is already used in this workflow."
-            raise WorkflowError(msg)
-        node_id = base
-        counter = 2
-        while node_id in self._ids:
-            node_id = f"{base}_{counter}"
-            counter += 1
-        self._ids.add(node_id)
-        return node_id
-
-
-def _tool_input(value: Any) -> dict[str, Any]:
-    """Wrap a runtime argument as Dify's tool input, constant or variable."""
-    if isinstance(value, VarRef):
-        return {"type": "variable", "value": value.selector}
-    if isinstance(value, Node):
-        return {"type": "variable", "value": value.output.selector}
-    if isinstance(value, str) and "{{#" in value:
-        return {"type": "mixed", "value": value}
-    return {"type": "constant", "value": value}
-
-
-def load_yaml(source: str | Path) -> dict[str, Any]:
-    """Read a Dify DSL document from a path or a YAML string."""
-    path = Path(source) if isinstance(source, (str, Path)) else None
-    if path is not None and path.exists():
-        return yaml.safe_load(path.read_text(encoding="utf-8"))
-    return yaml.safe_load(str(source))
-
-
-def _iter_ids(nodes: Iterable[Node]) -> list[str]:
-    return [n.id for n in nodes]
+            outcome = _sweep_named(console.apps, name)
+            msg = (
+                f"Dify's answer to the import never arrived ({draft.error}). {outcome}."
+            )
+            raise LiveRunError(msg)
+        try:
+            draft.raise_for_stage(Stage.DRAFTED)
+            return cast(
+                RunResult,
+                console.apps.run_draft(
+                    draft.app_id or app_id,
+                    inputs,
+                    query=query,
+                    conversation_id=conversation_id,
+                ),
+            )
+        finally:
+            # Only an app this call created is this call's to delete; one
+            # named by app_id is the caller's, draft and all.
+            if not app_id and draft.imported and draft.app_id:
+                try:
+                    console.apps.delete(draft.app_id)
+                # A cleanup failure must not replace the run's own outcome.
+                except Exception:  # noqa: BLE001  # nosec B110
+                    pass

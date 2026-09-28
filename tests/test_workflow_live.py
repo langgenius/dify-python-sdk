@@ -46,27 +46,51 @@ def llm_workflow(*, with_plugin: bool = False) -> Workflow:
 
 
 class FakeApps:
-    """The apps resource, recording what it was asked to deploy."""
+    """The apps resource, recording what a live run asked of it.
 
-    def __init__(self, console):
+    ``deploy`` and ``publish`` fail the test outright: a live run imports and
+    runs a draft, and releasing anything is not its business.
+    """
+
+    def __init__(self, console, *, run_fails=False):
         self._console = console
+        self._run_fails = run_fails
 
-    def deploy(self, workflow, *, app_id=None, name=None, key=True, publish=True):
+    def import_definition(self, workflow, *, app_id=None, name=None):
         from dify_client.lifecycle import Deployment
 
-        self._console.deployed.append((workflow.name, app_id))
-        # run_live needs a published app, so that is what a deploy reports.
+        self._console.imported.append((workflow.name, app_id, name))
         return Deployment(
-            imported=True, published=True, app_id=app_id or "new", app_mode="workflow"
+            imported=True,
+            app_id=app_id or "tmp-1",
+            app_mode=workflow.mode,
+            created=app_id is None,
         )
+
+    def run_draft(self, app, inputs=None, *, query=None, conversation_id=None):
+        self._console.ran.append((app, dict(inputs or {}), query))
+        if self._run_fails:
+            raise RuntimeError("the run went wrong")
+        return RunResult(status="succeeded", outputs={"answer": "hi"})
+
+    def delete(self, app):
+        self._console.deleted.append(app)
+
+    def deploy(self, *args, **kwargs):
+        raise AssertionError("a live run deployed, which publishes")
+
+    def publish(self, *args, **kwargs):
+        raise AssertionError("a live run published")
 
 
 class FakeConsole:
-    """Stands in for DifyManagement; records what it was asked to deploy."""
+    """Stands in for DifyManagement."""
 
-    def __init__(self):
-        self.deployed: list[tuple[str, str | None]] = []
-        self.apps = FakeApps(self)
+    def __init__(self, *, run_fails=False):
+        self.imported: list[tuple[str, str | None, str | None]] = []
+        self.ran: list[tuple[str, dict, str | None]] = []
+        self.deleted: list[str] = []
+        self.apps = FakeApps(self, run_fails=run_fails)
 
 
 class TestTheGate:
@@ -125,25 +149,83 @@ class TestRunLive:
             llm_workflow().run_live({"q": "hi"})
 
 
-class TestDeployingBeforeRunning:
-    def test_a_console_without_an_app_id_is_refused(self, monkeypatch):
-        monkeypatch.setenv(LIVE_ENABLED_ENV, "1")
-        with pytest.raises(LiveRunError, match="app_id"):
-            llm_workflow(with_plugin=True).run_live({"q": "hi"}, console=FakeConsole())
+class TestALiveRunRunsADraftAndPublishesNothing:
+    """It used to deploy over the named app and publish, so every test run
+    replaced what that app's users were served with the code under test.
+    Testing a definition and releasing it are two acts."""
 
-    def test_an_app_id_without_a_console_is_refused(self, monkeypatch):
-        """Otherwise it reads as "deploy here" while deploying nothing."""
-        monkeypatch.setenv(LIVE_ENABLED_ENV, "1")
-        with pytest.raises(LiveRunError, match="nothing to deploy with"):
-            llm_workflow(with_plugin=True).run_live({"q": "hi"}, app_id="a1")
-
-    def test_the_workflow_is_deployed_over_the_named_app(self, monkeypatch):
+    def test_nothing_is_deployed_or_published(self, monkeypatch):
         monkeypatch.setenv(LIVE_ENABLED_ENV, "1")
         console = FakeConsole()
-        wf = llm_workflow(with_plugin=True)
-        with pytest.raises(Exception):  # noqa: B017,PT011 - the run itself is not stubbed
-            wf.run_live({"q": "hi"}, console=console, app_id="a1")
-        assert console.deployed == [("live-app", "a1")]
+
+        result = llm_workflow(with_plugin=True).run_live(
+            {"q": "hi"}, console=console, query="hi"
+        )
+
+        assert result.outputs == {"answer": "hi"}
+        assert console.ran == [("tmp-1", {"q": "hi"}, "hi")]
+
+    def test_a_temporary_app_is_made_for_the_run_and_deleted(self, monkeypatch):
+        monkeypatch.setenv(LIVE_ENABLED_ENV, "1")
+        console = FakeConsole()
+
+        llm_workflow(with_plugin=True).run_live(
+            {"q": "hi"}, console=console, query="hi"
+        )
+
+        ((name, app_id, temporary),) = console.imported
+        assert (name, app_id) == ("live-app", None)
+        assert temporary.startswith("live-app-run-live-")
+        assert console.deleted == ["tmp-1"]
+
+    def test_the_temporary_app_is_deleted_when_the_run_fails(self, monkeypatch):
+        monkeypatch.setenv(LIVE_ENABLED_ENV, "1")
+        console = FakeConsole(run_fails=True)
+
+        with pytest.raises(RuntimeError, match="went wrong"):
+            llm_workflow(with_plugin=True).run_live(
+                {"q": "hi"}, console=console, query="hi"
+            )
+        assert console.deleted == ["tmp-1"]
+
+    def test_a_named_app_has_its_draft_run_and_is_kept(self, monkeypatch):
+        """Where its secrets are set. Its draft is overwritten; its published
+        version is not touched, and the app is the caller's, not ours."""
+        monkeypatch.setenv(LIVE_ENABLED_ENV, "1")
+        console = FakeConsole()
+
+        llm_workflow(with_plugin=True).run_live(
+            {"q": "hi"}, console=console, app_id="a1", query="hi"
+        )
+
+        assert console.imported == [("live-app", "a1", None)]
+        assert console.ran[0][0] == "a1"
+        assert console.deleted == []
+
+    def test_the_console_is_found_when_the_run_is_asked_for(self, monkeypatch):
+        import dify_client.console as console_module
+
+        monkeypatch.setenv(LIVE_ENABLED_ENV, "1")
+        monkeypatch.setenv(CONSOLE_TOKEN_ENV, "ey.T")
+        made = FakeConsole()
+        monkeypatch.setattr(console_module, "DifyManagement", lambda: made)
+
+        llm_workflow(with_plugin=True).run_live({"q": "hi"}, query="hi")
+
+        assert made.ran
+
+    def test_an_app_id_with_only_a_key_is_refused(self, monkeypatch):
+        """A key runs an app as published; it has no draft to import into."""
+        monkeypatch.setenv(LIVE_ENABLED_ENV, "1")
+        with pytest.raises(LiveRunError, match="needs a console session"):
+            llm_workflow(with_plugin=True).run_live(
+                {"q": "hi"}, api_key=APP_KEY, app_id="a1"
+            )
+
+    def test_no_way_in_says_what_to_set(self, monkeypatch):
+        monkeypatch.setenv(LIVE_ENABLED_ENV, "1")
+        with pytest.raises(LiveRunError, match=CONSOLE_TOKEN_ENV):
+            llm_workflow(with_plugin=True).run_live({"q": "hi"}, query="hi")
 
 
 class TestPluginPreflight:
@@ -166,7 +248,7 @@ class TestPluginPreflight:
         console = FakeConsole()
         with pytest.raises(LiveRunError, match="depends_on"):
             llm_workflow().run_live({"q": "hi"}, console=console, app_id="a1")
-        assert console.deployed == []
+        assert console.imported == []
 
 
 class TestBudget:
@@ -338,3 +420,80 @@ class TestFreeIsNotUnknown:
 
     def test_adding_two_unknowns_stays_unknown(self):
         assert not (Usage(total_tokens=1) + Usage(total_tokens=1)).cost_known
+
+
+class LostImportApps(FakeApps):
+    """An import whose answer never came back, over a workspace in which it
+    did — or did not — create the app."""
+
+    def __init__(self, console, *, created: bool):
+        super().__init__(console)
+        self._created = created
+        self.named: list[str] = []
+
+    def import_definition(self, workflow, *, app_id=None, name=None):
+        from dify_client.lifecycle import Deployment
+
+        self.named.append(name)
+        return Deployment(indeterminate=True, error="read timed out")
+
+    def list(self, *, name=None):
+        apps = self
+        created = self._created
+
+        class Page:
+            def all(self):
+                from types import SimpleNamespace
+
+                if not created:
+                    return []
+                # The listing matches by substring; only the exact name is ours.
+                return [
+                    SimpleNamespace(id="lost-1", name=apps.named[-1]),
+                    SimpleNamespace(id="theirs", name=f"{apps.named[-1]}-copy"),
+                ]
+
+        return Page()
+
+
+class TestAnImportThatNeverAnsweredLeavesNothingUnsaid:
+    """With no answer there is no app id, and the cleanup that deletes by id
+    did nothing — a temporary app could be left behind with no word of it."""
+
+    def console(self, *, created):
+        console = FakeConsole()
+        console.apps = LostImportApps(console, created=created)
+        return console
+
+    def test_the_app_it_created_is_found_by_name_and_deleted(self, monkeypatch):
+        monkeypatch.setenv(LIVE_ENABLED_ENV, "1")
+        console = self.console(created=True)
+
+        with pytest.raises(
+            LiveRunError, match="had been created anyway, and was deleted"
+        ):
+            llm_workflow(with_plugin=True).run_live(
+                {"q": "hi"}, console=console, query="hi"
+            )
+        assert console.deleted == ["lost-1"]
+
+    def test_nothing_else_is_touched(self, monkeypatch):
+        """The listing matches by substring; a longer name is someone else's."""
+        monkeypatch.setenv(LIVE_ENABLED_ENV, "1")
+        console = self.console(created=True)
+
+        with pytest.raises(LiveRunError):
+            llm_workflow(with_plugin=True).run_live(
+                {"q": "hi"}, console=console, query="hi"
+            )
+        assert "theirs" not in console.deleted
+
+    def test_it_says_so_when_there_was_nothing(self, monkeypatch):
+        monkeypatch.setenv(LIVE_ENABLED_ENV, "1")
+        console = self.console(created=False)
+
+        with pytest.raises(LiveRunError, match="No app called .* was created"):
+            llm_workflow(with_plugin=True).run_live(
+                {"q": "hi"}, console=console, query="hi"
+            )
+        assert console.deleted == []

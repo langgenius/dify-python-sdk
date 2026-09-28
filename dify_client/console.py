@@ -20,10 +20,12 @@ import httpx
 from .base_client import check_timeout
 from .catalog import ModelProvider, providers_from
 from .exceptions import APIError, AuthenticationError, ValidationError
+from .lifecycle import PipelineDeployment
 from .paging import by_page
-from .results import Page
+from .results import MAX_WALK, Page, PageLimitReached, WorkflowRun
 from .secrets import HOST_ENV, ApiKeyInput, resolve_api_key, resolve_host
 from .skills import Skill, WorkspaceSkill
+from .streams import collect_run
 from .tools import ToolCatalog, parse_provider
 from .version import user_agent
 
@@ -36,10 +38,10 @@ if TYPE_CHECKING:
 
 #: Environment variable holding a console session token.
 #:
-#: Deliberately *not* ``DIFY_CONSOLE_TOKEN``: that is what ``difyctl`` reads, and it
+#: Named apart from ``DIFY_TOKEN``, which is what ``difyctl`` reads: that one
 #: holds a ``dfoa_`` OAuth bearer for the ``/openapi/v1`` surface — a different
-#: credential for a different API. The host variable is shared, because that
-#: one does mean the same thing in both.
+#: credential for a different API, which the console rejects. The host variable
+#: is shared, because that one does mean the same thing in both.
 # The name of an environment variable, not a credential.
 CONSOLE_TOKEN_ENV = "DIFY_CONSOLE_TOKEN"  # nosec B105
 
@@ -97,7 +99,7 @@ class ImportResult:
             msg = (
                 f"Dify wants this import confirmed: the document is DSL "
                 f"{self.imported_dsl_version} and the server is on "
-                f"{self.current_dsl_version}. Call confirm_import(result.id) "
+                f"{self.current_dsl_version}. Call apps.confirm(result.id) "
                 "once you are satisfied the difference is safe."
             )
             raise ValidationError(msg)
@@ -195,6 +197,26 @@ class AgentSummary:
         return f"AgentSummary({self.name!r}, role={self.role!r})"
 
 
+@dataclass(frozen=True)
+class PipelineSummary:
+    """A knowledge pipeline as the workspace reports it.
+
+    Two ids, because they address two things: ``id`` is the pipeline whose
+    graph is published, ``dataset_id`` the knowledge base it fills. The
+    knowledge base is what owns the pipeline, so deleting it is what deletes
+    both.
+    """
+
+    id: str
+    dataset_id: str
+    name: str
+    description: str = ""
+    published: bool = False
+
+    def __repr__(self) -> str:
+        return f"PipelineSummary({self.name!r}, published={self.published})"
+
+
 class DifyManagement:
     """A client for the Dify console API, for work the Service API cannot do.
 
@@ -244,7 +266,7 @@ class DifyManagement:
             timeout=httpx.Timeout(resolved_timeout, connect=5.0),
         )
 
-        from .resources.management import Agents, Apps, Models, Skills, Tools
+        from .resources.management import Agents, Apps, Models, Pipelines, Skills, Tools
 
         #: The workspace's apps, and the steps from a definition to a run.
         #: The workspace's apps, its keys and its triggers.
@@ -253,6 +275,8 @@ class DifyManagement:
         self.skills = Skills(self)
         #: Agents, which Dify keeps off the app list.
         self.agents = Agents(self)
+        #: Knowledge pipelines, and the knowledge bases they fill.
+        self.pipelines = Pipelines(self)
         #: What the workspace can call, and whether credentials are in place.
         self.models = Models(self)
         #: Installed tool providers and plugins.
@@ -401,12 +425,14 @@ class DifyManagement:
                 "edit the agent in the console."
             )
             raise ValidationError(msg)
-        result = self._import_app(
+        # The status is returned rather than raised, the same way importing a
+        # string of DSL returns it: a held import is a state the caller acts
+        # on by confirming, and raising here turned it into a bare failure.
+        return self._import_app(
             deployable.to_yaml(),
             app_id=app_id,
             name=name or deployable.name,
         )
-        return result.raise_for_status()
 
     def _export_app(self, app_id: str, *, include_secret: bool = False) -> str:
         """Export an app's DSL, the way the console's Export button does.
@@ -430,6 +456,44 @@ class DifyManagement:
             msg = f"Dify returned no DSL for app {app_id}."
             raise ValidationError(msg)
         return data
+
+    def _run_draft(
+        self,
+        app_id: str,
+        *,
+        mode: str,
+        inputs: Mapping[str, Any] | None = None,
+        query: str | None = None,
+        conversation_id: str | None = None,
+    ) -> WorkflowRun:
+        """Run an app's **draft**, the way the editor's Run button does.
+
+        Nothing is published: the Service API and ``/openapi/v1`` both run the
+        published version only, so this is the one way to run a document that
+        has been imported and not released. Dify serves a chatflow's draft at
+        its own path, and it needs a message.
+        """
+        body: dict[str, Any] = {"inputs": dict(inputs or {})}
+        if mode in _CHAT_APP_MODES:
+            if not query:
+                msg = (
+                    "A chatflow is driven by a message, so running its draft "
+                    "needs query=... — it becomes sys.query."
+                )
+                raise ValidationError(msg)
+            body["query"] = query
+            if conversation_id:
+                body["conversation_id"] = conversation_id
+            path = f"/apps/{app_id}/advanced-chat/workflows/draft/run"
+        else:
+            path = f"/apps/{app_id}/workflows/draft/run"
+        with self._client.stream(
+            "POST", path, json=body, headers=self._headers()
+        ) as response:
+            if response.status_code >= 400:
+                response.read()
+                _payload(response)
+            return collect_run(response.iter_lines())
 
     def _publish_workflow(
         self,
@@ -595,6 +659,129 @@ class DifyManagement:
             msg = f"This workspace has no Agent named {name!r}."
             raise ValidationError(msg)
         return found[0]
+
+    # -- knowledge pipelines -----------------------------------------------
+
+    def _import_pipeline(
+        self,
+        yaml_content: str,
+        *,
+        pipeline_id: str | None = None,
+    ) -> PipelineDeployment:
+        """Create a knowledge pipeline from a DSL document, or overwrite one.
+
+        Dify creates the knowledge base as part of this, named after the
+        document's own ``rag_pipeline.name``. The payload's ``name`` field is
+        accepted and never read, so it is not sent: a parameter that quietly
+        does nothing is worse than one that is missing.
+        """
+        body: dict[str, Any] = {"mode": "yaml-content", "yaml_content": yaml_content}
+        if pipeline_id:
+            body["pipeline_id"] = pipeline_id
+        return _pipeline_deployment(
+            _payload(
+                self._client.post(
+                    "/rag/pipelines/imports", json=body, headers=self._headers()
+                )
+            )
+        )
+
+    def _confirm_pipeline_import(self, import_id: str) -> PipelineDeployment:
+        """Confirm an import Dify held back over a DSL version difference."""
+        return _pipeline_deployment(
+            _payload(
+                self._client.post(
+                    f"/rag/pipelines/imports/{import_id}/confirm",
+                    headers=self._headers(),
+                )
+            )
+        )
+
+    def _publish_pipeline(self, pipeline_id: str) -> None:
+        """Publish a pipeline's draft, which is what lets it accept documents."""
+        _payload(
+            self._client.post(
+                f"/rag/pipelines/{pipeline_id}/workflows/publish",
+                json={},
+                headers=self._headers(),
+            )
+        )
+
+    def _export_pipeline(
+        self, pipeline_id: str, *, include_secret: bool = False
+    ) -> str:
+        """Export a pipeline's DSL, the way the console's Export button does."""
+        payload = _payload(
+            self._client.get(
+                f"/rag/pipelines/{pipeline_id}/exports",
+                params={"include_secret": str(include_secret).lower()},
+                headers=self._headers(),
+            )
+        )
+        data = payload.get("data")
+        if not isinstance(data, str) or not data:
+            msg = f"Dify returned no DSL for pipeline {pipeline_id}."
+            raise ValidationError(msg)
+        return data
+
+    def _pipelines(self, *, limit: int = 100) -> list[PipelineSummary]:
+        """The workspace's knowledge pipelines, read off the knowledge bases.
+
+        A pipeline has no listing of its own: it is reported by the knowledge
+        base that owns it, and a base built by hand carries no ``pipeline_id``.
+        That is why this walks the pages rather than reading one — most bases
+        are not pipelines, so the only pipeline in a workspace can easily sit
+        behind thirty that are not, and a first page would report none.
+
+        The walk stops at :data:`~dify_client.results.MAX_WALK` bases, the
+        same ceiling :meth:`Page.all` uses, rather than trusting a server that
+        never says stop.
+        """
+        found: list[PipelineSummary] = []
+        seen = 0
+        page = 1
+        while True:
+            payload = _payload(
+                self._client.get(
+                    "/datasets",
+                    params={"page": page, "limit": limit},
+                    headers=self._headers(),
+                )
+            )
+            items = payload.get("data") or []
+            seen += len(items)
+            found.extend(
+                PipelineSummary(
+                    id=str(item.get("pipeline_id") or ""),
+                    dataset_id=str(item.get("id", "")),
+                    name=str(item.get("name", "")),
+                    description=str(item.get("description") or ""),
+                    published=bool(item.get("is_published")),
+                )
+                for item in items
+                if item.get("pipeline_id")
+            )
+            if not items or not payload.get("has_more"):
+                return found
+            if seen >= MAX_WALK:
+                # Returning what was read would be a listing that quietly
+                # stopped early, which is the bug `Page.all()` was written to
+                # fix. The partial result travels on the exception.
+                raise PageLimitReached(found, MAX_WALK)
+            page += 1
+
+    def _delete_dataset(self, dataset_id: str) -> None:
+        """Delete a knowledge base, and the pipeline that fills it with it.
+
+        httpx does not raise on a 4xx, so the status is read: reporting a
+        deletion that Dify refused would leave the base and its pipeline in
+        the workspace with nothing said about it.
+        """
+        response = self._client.delete(
+            f"/datasets/{dataset_id}", headers=self._headers()
+        )
+        if response.status_code not in (200, 204):
+            _payload(response)
 
     # -- skills ------------------------------------------------------------
 
@@ -1050,6 +1237,24 @@ def _payload(response: httpx.Response) -> dict[str, Any]:
             headers=response.headers,
         )
     return body if isinstance(body, dict) else {}
+
+
+def _pipeline_deployment(payload: dict[str, Any]) -> PipelineDeployment:
+    """Read a pipeline import answer, which reports two ids and a status."""
+    status = str(payload.get("status", ""))
+    return PipelineDeployment(
+        imported=status in _OK_STATUSES,
+        # Dify holds an import over a DSL version difference rather than
+        # refusing it, and the hold is undone by confirming, not by retrying.
+        needs_confirmation=status == "pending",
+        pipeline_id=str(payload.get("pipeline_id") or ""),
+        dataset_id=str(payload.get("dataset_id") or ""),
+        import_id=str(payload.get("id") or ""),
+        imported_dsl_version=str(payload.get("imported_dsl_version") or ""),
+        current_dsl_version=str(payload.get("current_dsl_version") or ""),
+        error=str(payload.get("error") or ""),
+        payload=dict(payload),
+    )
 
 
 def _import_result(payload: dict[str, Any]) -> ImportResult:

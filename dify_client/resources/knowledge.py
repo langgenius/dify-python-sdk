@@ -15,6 +15,7 @@ from typing import Any, BinaryIO, List, Literal, NoReturn
 from ..exceptions import APIError, RequestTimeout, ValidationError
 from ..paging import by_page, by_page_async, unpaged, unpaged_async
 from ..results import AsyncPage, Page, WorkflowRun
+from ..search import split_model
 from ..streams import AsyncWorkflowRunStream, WorkflowRunStream
 from ._base import Resource, Transport
 from .runs import _run_from_blocking
@@ -189,6 +190,34 @@ class PipelineIngestion:
         return len(self.documents)
 
 
+def _split_model(model: str, what: str) -> tuple[str, str]:
+    """Split a model reference, reporting it in this client's own error.
+
+    The parsing belongs to :mod:`dify_client.search`, which the workflow
+    builder uses too; only the exception differs. A bare ``ValueError`` out of
+    here escapes ``except DifyClientError``, which is what callers wrap a
+    knowledge call in.
+    """
+    try:
+        return split_model(model, what)
+    except ValueError as error:
+        raise ValidationError(str(error)) from error
+
+
+def _datasource_nodes(payload: Any) -> List[dict[str, Any]]:
+    """Read the datasource listing, which is a bare array.
+
+    Every other listing in the knowledge API is wrapped in ``{"data": [...]}``;
+    this one is a `RootModel[list[...]]` on Dify's side and arrives unwrapped,
+    so reading it like the others raised `AttributeError` on the first real
+    pipeline. Both shapes are accepted because the difference is the server's
+    to change, and neither is worth a crash.
+    """
+    if isinstance(payload, list):
+        return list(payload)
+    return list(payload.get("data", []))
+
+
 def _ingestion(payload: Mapping[str, Any], dataset_id: str) -> PipelineIngestion:
     """Shape a published pipeline run: a batch, and the documents it queued."""
     batch = str(payload.get("batch") or "")
@@ -326,12 +355,52 @@ def _one_source(text: Any, file: Any) -> None:
         raise ValidationError(msg)
 
 
+def _part_name(file: str | Path | BinaryIO, filename: str | None) -> str:
+    """The name a file part is sent under, worked out without reading it.
+
+    An open file knows its own name; it used to be sent as ``document``
+    regardless, which a pipeline upload then refused for having no extension.
+    """
+    if filename:
+        return filename
+    if isinstance(file, (str, Path)):
+        return Path(str(file)).name
+    own = getattr(file, "name", None)
+    # A BytesIO has no name, and a file opened from a descriptor has an int.
+    return Path(own).name if isinstance(own, str) and own else "document"
+
+
 def _part(file: str | Path | BinaryIO, filename: str | None) -> tuple[str, bytes]:
     """The name and bytes of a file part, from a path or an open file."""
-    path = Path(str(file)) if isinstance(file, (str, Path)) else None
-    name = filename or (path.name if path else "document")
-    content = path.read_bytes() if path else file.read()  # type: ignore[union-attr]
+    name = _part_name(file, filename)
+    content = (
+        Path(str(file)).read_bytes() if isinstance(file, (str, Path)) else file.read()
+    )
     return name, content
+
+
+def _pipeline_part(
+    file: str | Path | BinaryIO, filename: str | None
+) -> tuple[str, bytes]:
+    """The part a pipeline upload sends, with the extension Dify reads.
+
+    Dify picks the reader by extension and refuses a name without one —
+    "Unsupported Extension Type: ." — and the document then fails indexing
+    rather than the upload. Passing a literal fallback name here was doing
+    exactly that to every upload made from a path.
+
+    The name is checked before anything is read, so a refused open file is
+    left where it was rather than exhausted.
+    """
+    name = _part_name(file, filename)
+    if not Path(name).suffix:
+        msg = (
+            f"{name!r} has no file extension, and Dify chooses how to read a "
+            "document by its extension. Pass filename='handbook.pdf' (or "
+            "whatever it is) alongside the file."
+        )
+        raise ValidationError(msg)
+    return _part(file, name)
 
 
 def _batch_key(batch: Document | str) -> str:
@@ -438,9 +507,31 @@ class Datasets(Resource):
         description: str | None = None,
         indexing_technique: Literal["high_quality", "economy"] | None = None,
         permission: str | None = None,
+        embedding: str | None = None,
+        retrieval: Mapping[str, Any] | None = None,
         **extra: Any,
     ) -> Dataset:
-        """Create a knowledge base."""
+        """Create a knowledge base.
+
+        ``embedding`` is the model its chunks are indexed with, spelled the way
+        every other model reference is — ``provider/plugin/name:model``, from
+        ``DifyKnowledge.models("text-embedding")``. It applies to
+        ``high_quality`` indexing; ``economy`` searches by keyword and uses no
+        model.
+
+        ``retrieval`` is how the base is searched, built with
+        :func:`dify_client.retrieval_model`::
+
+            base = knowledge.datasets.create(
+                "handbook",
+                indexing_technique="high_quality",
+                embedding="langgenius/openai/openai:text-embedding-3-small",
+                retrieval=retrieval_model(rerank="langgenius/cohere/cohere:rerank-v3.5"),
+            )
+
+        Both are settings on the base, so they decide how every later
+        retrieval behaves — including the one a workflow's knowledge node does.
+        """
         body: dict[str, Any] = {"name": name, **extra}
         if description is not None:
             body["description"] = description
@@ -448,6 +539,12 @@ class Datasets(Resource):
             body["indexing_technique"] = indexing_technique
         if permission is not None:
             body["permission"] = permission
+        if embedding is not None:
+            provider, model = _split_model(embedding, "embedding")
+            body["embedding_model_provider"] = provider
+            body["embedding_model"] = model
+        if retrieval is not None:
+            body["retrieval_model"] = dict(retrieval)
         return _dataset(self._client._send_request("POST", "/datasets", body).json())
 
     def list(
@@ -1008,7 +1105,7 @@ class Pipeline(Resource):
             f"/datasets/{self.dataset_id}/pipeline/datasource-plugins",
             params={"is_published": published},
         ).json()
-        return list(payload.get("data", []))
+        return _datasource_nodes(payload)
 
     def _request(self, method: str, path: str, *args: Any, **kwargs: Any) -> Any:
         """Send, turning "Pipeline not found" into something actionable."""
@@ -1139,7 +1236,7 @@ class Pipeline(Resource):
         Workspace-level rather than per-pipeline, which is why it is a
         ``staticmethod`` here and exposed as ``knowledge.upload_for_pipeline``.
         """
-        name, content = _part(file, filename or "upload")
+        name, content = _pipeline_part(file, filename)
         return client._send_request_with_files(
             "POST",
             "/datasets/pipeline/file-upload",
@@ -1158,9 +1255,11 @@ class AsyncDatasets(Resource):
         description: str | None = None,
         indexing_technique: Literal["high_quality", "economy"] | None = None,
         permission: str | None = None,
+        embedding: str | None = None,
+        retrieval: Mapping[str, Any] | None = None,
         **extra: Any,
     ) -> Dataset:
-        """Create a knowledge base."""
+        """Create a knowledge base. See the sync twin for what each setting does."""
         body: dict[str, Any] = {"name": name, **extra}
         if description is not None:
             body["description"] = description
@@ -1168,6 +1267,12 @@ class AsyncDatasets(Resource):
             body["indexing_technique"] = indexing_technique
         if permission is not None:
             body["permission"] = permission
+        if embedding is not None:
+            provider, model = _split_model(embedding, "embedding")
+            body["embedding_model_provider"] = provider
+            body["embedding_model"] = model
+        if retrieval is not None:
+            body["retrieval_model"] = dict(retrieval)
         response = await self._client._send_request("POST", "/datasets", body)
         return _dataset(response.json())
 
@@ -1676,7 +1781,7 @@ class AsyncPipeline(Resource):
             f"/datasets/{self.dataset_id}/pipeline/datasource-plugins",
             params={"is_published": published},
         )
-        return list(response.json().get("data", []))
+        return _datasource_nodes(response.json())
 
     async def run_datasource(
         self,
@@ -1770,7 +1875,7 @@ class AsyncPipeline(Resource):
         client: Transport, file: str | Path | BinaryIO, *, filename: str | None = None
     ) -> dict[str, Any]:
         """Upload a file for a pipeline to pick up. Workspace-level."""
-        name, content = _part(file, filename or "upload")
+        name, content = _pipeline_part(file, filename)
         response = await client._send_request_with_files(
             "POST",
             "/datasets/pipeline/file-upload",

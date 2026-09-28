@@ -101,3 +101,12 @@ class TestWhatReplacedThem:
                     continue
                 annotation = inspect.signature(getattr(group, name)).return_annotation
                 assert "Response" not in str(annotation), f"{group}.{name}"
+
+
+def test_the_helper_that_rendered_a_node_as_its_id_is_gone():
+    """``as_dsl()`` had no callers and still turned a node into its id — the
+    behaviour ``Node.__str__`` was changed away from, because it put the word
+    "llm" into an answer a user read. ``render()`` is the one that is right."""
+    from dify_client.workflow import refs
+
+    assert not hasattr(refs, "as_dsl")

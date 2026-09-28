@@ -12,6 +12,7 @@ from typing import Any
 
 from ..lifecycle import Deployment
 from ._base import Resource
+from .management import _confirmed, _imported
 
 __all__ = ["OpenApiApps"]
 
@@ -48,22 +49,23 @@ class OpenApiApps(Resource):
     def import_definition(
         self, definition: Any, *, app_id: str | None = None, name: str | None = None
     ) -> Deployment:
-        """Write a definition to Dify as a draft."""
-        result = self._client._deploy(definition, app_id=app_id, name=name)
-        resolved = result.app_id or app_id or ""
-        if not resolved:
-            return Deployment(
-                imported=False,
-                error=result.error or "Dify returned no app id.",
-            )
-        return Deployment(
-            imported=True,
-            app_id=resolved,
-            app_mode=str(result.app_mode or ""),
-            created=app_id is None,
-            warnings=tuple(result.warnings or ()),
-            payload={"import": result.__dict__},
-        )
+        """Write a definition to Dify as a draft.
+
+        Read the way the console's import is: a held import comes back with
+        ``needs_confirmation`` and the ``import_id`` :meth:`confirm` takes, and
+        a lost answer comes back ``indeterminate``.
+        """
+
+        def attempt() -> Any:
+            if isinstance(definition, str):
+                return self._client._import_app(definition, app_id=app_id, name=name)
+            return self._client._deploy(definition, app_id=app_id, name=name)
+
+        return _imported(attempt, app_id=app_id, definition=definition)
+
+    def confirm(self, deployment: Any) -> Deployment:
+        """Confirm an import Dify held over a DSL version difference."""
+        return _confirmed(deployment, self._client._confirm_import)
 
     def deploy(
         self, definition: Any, *, app_id: str | None = None, name: str | None = None

@@ -12,9 +12,12 @@ from pathlib import Path
 import pytest
 import yaml
 
-from dify_client.workflow import StubLLM
+from dify_client.workflow import StubCode, StubKnowledge, StubLLM
 
 EXAMPLES = Path(__file__).resolve().parent.parent / "examples"
+
+#: The model name example 10 indexes with, split from its full reference.
+EMBEDDING_NAME = "text-embedding-3-small"
 
 
 def load(name: str):
@@ -34,9 +37,11 @@ ALL_EXAMPLES = [
     "05_deploy_and_run.py",
     "06_code_node.py",
     "08_webhook_trigger.py",
+    "09_knowledge_and_iteration.py",
 ]
 
-# 07 keeps an Agent rather than a Workflow, so the shared checks do not apply.
+# 07 keeps an Agent and 10 a knowledge pipeline, so the shared checks — which
+# read an app's `kind` and mode — do not apply to either.
 
 
 @pytest.mark.parametrize("name", ALL_EXAMPLES)
@@ -106,6 +111,66 @@ class TestBranching:
             answer = wf.run({"message": message}, raise_on_error=True)["answer"]
             assert "{{#" not in answer
             assert ".output" not in answer
+
+
+class TestKnowledgePipeline:
+    def test_it_builds_a_pipeline_document_not_an_app(self):
+        document = yaml.safe_load(load("10_knowledge_pipeline.py").build().to_yaml())
+
+        assert document["kind"] == "rag_pipeline"
+        # datasource → extractor → chunker → knowledge base: the chain Dify's
+        # own templates use, and the only one that actually indexes.
+        assert [
+            node["data"]["type"] for node in document["workflow"]["graph"]["nodes"]
+        ] == ["datasource", "tool", "tool", "knowledge-index"]
+
+    def test_the_knowledge_base_it_creates_is_searched_the_way_it_says(self):
+        """The settings on this node become the base's, so they are the example."""
+        module = load("10_knowledge_pipeline.py")
+        index = next(n for n in module.build().nodes if n.type == "knowledge-index")
+
+        assert index.data.embedding_model == EMBEDDING_NAME
+        assert index.data.retrieval_model["search_method"] == "hybrid_search"
+        assert index.data.retrieval_model["reranking_enable"] is True
+
+    def test_its_input_is_referenced_through_rag_and_the_datasource(self):
+        pipe = load("10_knowledge_pipeline.py").build()
+        (variable,) = pipe.variables
+
+        assert variable.ref.selector == ["rag", "files", "source"]
+
+    def test_it_stops_before_touching_dify_when_the_gate_is_closed(
+        self, monkeypatch, capsys
+    ):
+        monkeypatch.delenv("DIFY_LIVE_TESTS", raising=False)
+        assert load("10_knowledge_pipeline.py").main() == 0
+        assert "stopping before touching Dify" in capsys.readouterr().out
+
+
+class TestKnowledgeAndIteration:
+    def test_the_iteration_runs_once_per_retrieved_chunk(self):
+        """Retrieval is stubbed; the graph around it is what this asserts."""
+        module = load("09_knowledge_and_iteration.py")
+        knowledge = StubKnowledge(["one", "two", "three"])
+        code = StubCode({"lines": ["one", "two", "three"]})
+
+        result = module.build().run(
+            {"question": "anything"}, knowledge=knowledge, code=code
+        )
+
+        assert result.succeeded
+        assert result["citations"] == ["- one", "- two", "- three"]
+        assert knowledge.calls[0].top_k == 3
+
+    def test_it_says_which_knowledge_base_it_asked(self):
+        module = load("09_knowledge_and_iteration.py")
+        knowledge = StubKnowledge({module.DATASET_ID: ["a fact"]})
+
+        module.build().run(
+            {"question": "q"}, knowledge=knowledge, code=StubCode({"lines": ["a fact"]})
+        )
+
+        assert knowledge.calls[0].dataset_ids == (module.DATASET_ID,)
 
 
 class TestDeployAndRun:
