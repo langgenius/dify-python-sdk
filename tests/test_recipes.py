@@ -182,15 +182,19 @@ class TestFilePipeline:
 
         assert index.data.index_chunk_variable_selector == [chunker.id, "result"]
 
-    def test_the_chunker_reads_the_extractor_output_the_plugin_declares(self):
-        """Dify's extractor tool calls its result `output`, not `text`."""
+    def test_the_chunker_reads_the_extractor_s_text(self):
+        """A tool node's result is `text`, and the extractor declares no
+        `output` (its schema adds `documents` and `images`). Dify's own
+        templates read `output` from a variable aggregator placed between the
+        two; reading it from the extractor named nothing, and a run on Dify
+        indexed one chunk reading "tool.output" and reported success."""
         from dify_client.workflow.recipes import file_pipeline
 
         pipe = file_pipeline(name="handbook")
         extractor, chunker = [n for n in pipe.nodes if n.type == "tool"]
 
         assert chunker.data.tool_parameters["input_variable"].value == str(
-            extractor["output"]
+            extractor["text"]
         )
 
     def test_its_search_settings_are_the_ones_asked_for(self):

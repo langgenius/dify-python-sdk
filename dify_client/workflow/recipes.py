@@ -280,9 +280,14 @@ def chunked_text(
             tool="general_chunker",
             label="General Chunker",
             parameters={
+                # The extractor's output is `text`. Dify's own templates read
+                # `output`, but from a variable aggregator placed between the
+                # two; without one, `output` names nothing, and Dify indexed
+                # the unresolved reference itself — one chunk reading
+                # "tool.output" — and reported success.
                 "input_variable": {
                     "type": "mixed",
-                    "value": str(extract["output"]),
+                    "value": str(extract["text"]),
                 }
             },
         ),

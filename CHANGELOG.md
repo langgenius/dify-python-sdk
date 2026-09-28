@@ -89,6 +89,16 @@ a newer Dify adds still reaches the caller.
 
 ### Fixed
 
+- **`chunked_text()` gave the chunker a reference to nothing.** It read the
+  extractor's `output`, which the extractor does not have — Dify's templates
+  read `output` from a variable aggregator between the two. Run on Dify with
+  both plugins installed, the pipeline indexed one chunk reading
+  `tool.output` and reported success. It reads the extractor's `text` now, and
+  a live test runs a file through the whole chain and checks what was
+  indexed. (On a Dify whose `INTERNAL_FILES_URL` is unset, the extractor
+  cannot fetch the upload and says so in its text; the test skips there,
+  naming the setting.)
+
 **Four from a sixth review.**
 
 - **Confirming a held overwrite reported the caller's app as created.**

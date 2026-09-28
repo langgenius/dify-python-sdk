@@ -235,8 +235,75 @@ class TestTheShippedChain:
             ]
             assert (
                 tools[1]["data"]["tool_parameters"]["input_variable"]["value"]
-                == f"{{{{#{tools[0]['id']}.output#}}}}"
+                == f"{{{{#{tools[0]['id']}.text#}}}}"
             )
         finally:
             if result.dataset_id:
                 management.pipelines.delete(result)
+
+
+class TestAFileGoesAllTheWayIn:
+    def test_an_uploaded_file_is_indexed_and_found(
+        self, management, knowledge, tmp_path
+    ):
+        """The whole chain, run: upload, extract, chunk, index, search.
+
+        Everything before this stopped at "queued", because indexing needs the
+        extractor and chunker plugins. With them installed, a document goes in
+        and comes back out of a search. Economy indexing is keyword-only, so
+        this calls no model.
+        """
+        from dify_client.workflow.recipes import CHUNKER, EXTRACTOR, file_pipeline
+
+        installed = {p.get("plugin_id") for p in management.tools.plugins()}
+        needed = {EXTRACTOR.rsplit("/", 1)[0], CHUNKER.rsplit("/", 1)[0]}
+        if not needed <= installed:
+            pytest.skip(f"this workspace lacks {', '.join(sorted(needed - installed))}")
+
+        result = management.pipelines.deploy(file_pipeline(name=_named()))
+        try:
+            result.raise_for_stage()
+            document = tmp_path / "refunds.txt"
+            document.write_text(
+                "Refunds are issued within five business days.", encoding="utf-8"
+            )
+            uploaded = knowledge.upload_for_pipeline(document)
+
+            queued = knowledge.pipeline(result.dataset_id).run(
+                start_node_id="files",
+                datasource_type="local_file",
+                datasource_info_list=[
+                    {"reference": uploaded["id"], "name": "refunds.txt"}
+                ],
+                inputs={},
+            )
+            (queued_document,) = queued.documents
+            settled = knowledge.documents(result.dataset_id).wait_until_settled(
+                queued_document, timeout=180
+            )
+            assert settled.indexed, settled
+
+            # What the chunker was given is what was indexed. It used to be
+            # the unresolved reference itself — one chunk reading
+            # "tool.output" — and Dify reported success; the chunk has to be
+            # the extractor's text, whatever that text says.
+            chunks = [
+                segment.content
+                for segment in knowledge.documents(result.dataset_id)
+                .segments(queued_document)
+                .list()
+            ]
+            assert chunks and not any(c.startswith("tool.") for c in chunks), chunks
+            if any("FILES_URL" in c for c in chunks):
+                # The extractor ran and could not fetch the file: a deployment
+                # whose plugin runtime cannot reach Dify's file URLs. That is
+                # the server's configuration, not this chain.
+                pytest.skip(
+                    "the extractor cannot fetch uploads on this Dify; set "
+                    "INTERNAL_FILES_URL (e.g. http://api:5001) and restart it"
+                )
+
+            hits = knowledge.datasets.search(result.dataset_id, "refunds")
+            assert any("five business days" in hit.segment.content for hit in hits)
+        finally:
+            management.pipelines.delete(result)
