@@ -271,6 +271,15 @@ Each of these cost real debugging time.
   rather than a list written down here. The knowledge node is the one with a
   local stand-in (`knowledge=StubKnowledge([...])`), because retrieval has a
   seam a fixture can sit in; the rest do not.
+- **A human-input form that nobody answers continues along `__timeout`**,
+  not `timeout` — `TIMEOUT_HANDLE` in `core/workflow/nodes/human_input/
+  constants.py`, and the editor's handle id. Watched on 1.17.1: a form with
+  `timeout=1, timeout_unit="hour"` paused at 14:55:59 and finished along the
+  timeout arm at 15:58, the beat task (`human_input_form_timeout`, every
+  minute) picking it up within a couple of minutes of the deadline. An hour
+  is the shortest timeout Dify accepts, so no test waits for it; this note is
+  the evidence, and `Branch.timeout` is the spelling. A console session does
+  not outlive that wait either — log in again to clean up after one.
 - **Dify encrypts `dataset_ids` when it exports a workflow**, keyed by the
   tenant, and falls back to a plain UUID when it imports one. So a knowledge
   node built here imports fine, an export does not name the knowledge base, and
