@@ -141,9 +141,7 @@ class TestDeployingBeforeRunning:
         monkeypatch.setenv(LIVE_ENABLED_ENV, "1")
         console = FakeConsole()
         wf = llm_workflow(with_plugin=True)
-        with pytest.raises(
-            Exception
-        ):  # noqa: B017,PT011 - the run itself is not stubbed
+        with pytest.raises(Exception):  # noqa: B017,PT011 - the run itself is not stubbed
             wf.run_live({"q": "hi"}, console=console, app_id="a1")
         assert console.deployed == [("live-app", "a1")]
 

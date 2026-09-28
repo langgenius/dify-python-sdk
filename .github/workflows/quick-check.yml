@@ -39,13 +39,10 @@ jobs:
       run: |
         sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap
 
-    - name: Quick syntax check
+    - name: Run Ruff
       run: |
-        find dify_client tests -name "*.py" -exec uv run python -m py_compile {} \;
-
-    - name: Check import sorting
-      run: |
-        uv run isort --check-only dify_client tests
+        uv run ruff check dify_client tests
+        uv run ruff format --check dify_client tests
 
     - name: Run quick tests
       run: |

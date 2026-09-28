@@ -37,25 +37,14 @@ jobs:
       run: |
         uv sync --dev --extra workflow
 
-    - name: Run ruff (linting)
+    - name: Run Ruff
       run: |
         uv run ruff check dify_client tests
-
-    - name: Run black (check formatting)
-      run: |
-        uv run black --check dify_client tests
-
-    - name: Run isort (check import sorting)
-      run: |
-        uv run isort --check-only dify_client tests
+        uv run ruff format --check dify_client tests
 
     - name: Run mypy (type checking)
       run: |
         uv run mypy dify_client
-
-    - name: Compile Python files (syntax check)
-      run: |
-        uv run python -m py_compile $(find dify_client -name "*.py") $(find tests -name "*.py")
 
   test:
     name: Test Code

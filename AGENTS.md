@@ -69,10 +69,9 @@ uv run pytest                  # everything; the live harness skips itself
 uv run pytest -m "not live"    # unit tests only — what CI runs on every push
 uv run pytest tests/live       # the live harness (needs a Dify, see below)
 
-uv run --with ruff ruff check dify_client tests
-uv run --with black black --check dify_client tests
-uv run --with isort isort --check-only dify_client tests
-uv run --with mypy --with types-PyYAML mypy dify_client
+uv run ruff check dify_client tests
+uv run ruff format --check dify_client tests
+uv run mypy dify_client
 uv build && uv run --with twine twine check dist/*
 ```
 

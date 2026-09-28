@@ -86,29 +86,15 @@ markers = [
     "live: talks to a running Dify; skipped unless DIFY_HOST and console credentials are set",
 ]
 
-[tool.black]
+[tool.ruff]
 line-length = 88
-target-version = ['py312', 'py313']
-include = '\.pyi?$'
-extend-exclude = '''
-/(
-  # directories
-  \.eggs
-  | \.git
-  | \.hg
-  | \.mypy_cache
-  | \.tox
-  | \.venv
-  | build
-  | dist
-)/
-'''
+target-version = "py312"
 
-[tool.isort]
-profile = "black"
-multi_line_output = 3
-line_length = 88
-known_first_party = ["dify_client"]
+[tool.ruff.lint]
+extend-select = ["I"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["dify_client"]
 
 [tool.mypy]
 python_version = "3.12"
@@ -165,8 +151,6 @@ exclude_lines = [
 [dependency-groups]
 dev = [
     "bandit>=1.9.2",
-    "black>=25.12.0",
-    "isort>=5.12.0",
     "mypy>=1.0.0",
     "types-PyYAML>=6.0",
     "pytest>=8.4.2",

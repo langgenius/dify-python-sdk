@@ -522,8 +522,7 @@ class Workflow:
         """
         if (cron is None) == (frequency is None):
             msg = (
-                "A schedule needs exactly one of cron='0 2 * * *' or "
-                "frequency='daily'."
+                "A schedule needs exactly one of cron='0 2 * * *' or frequency='daily'."
             )
             raise WorkflowError(msg)
         if frequency is not None and frequency not in FREQUENCIES:

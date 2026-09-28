@@ -494,10 +494,9 @@ class TestTheListIsComplete:
             - self._deprecated(self.CONTROLLERS)
         )
 
-        assert (
-            uncovered == []
-        ), "Dify serves these and nothing here reaches them: " + ", ".join(
-            f"{v} {p}" for v, p in uncovered
+        assert uncovered == [], (
+            "Dify serves these and nothing here reaches them: "
+            + ", ".join(f"{v} {p}" for v, p in uncovered)
         )
 
     def test_the_check_notices_a_dropped_call(self):

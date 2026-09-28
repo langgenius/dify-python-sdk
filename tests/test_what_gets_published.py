@@ -64,9 +64,9 @@ class TestEveryDependencyEarnsItsPlace:
         for requirement in project["dependencies"]:
             name = self._named(requirement)
             module = self.PROVIDES.get(name, name)
-            assert any(
-                f"import {module}" in source for source in sources
-            ), f"{name} is installed for everyone and imported by nobody"
+            assert any(f"import {module}" in source for source in sources), (
+                f"{name} is installed for everyone and imported by nobody"
+            )
 
     def test_the_dependency_list_is_known(self, project):
         """So a new one cannot be added without deciding what it provides."""
@@ -174,6 +174,6 @@ class TestTheReleasePipelineRuns:
         assert publish["needs"] == ["build", "test-install"]
 
     def test_it_installs_the_wheel_both_ways(self, commands):
-        assert any(
-            "[workflow]" in command for command in commands
-        ), "the extra is never installed in CI"
+        assert any("[workflow]" in command for command in commands), (
+            "the extra is never installed in CI"
+        )
