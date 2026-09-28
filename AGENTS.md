@@ -244,6 +244,17 @@ Each of these cost real debugging time.
     `score_threshold_enabled` is true, so a threshold set alone reads as a
     filter that does nothing. `retrieval_model(score_threshold=…)` sets both,
     and omitting it turns the flag off — those are the two states.
+  - **A pipeline's extractor fetches the upload through `INTERNAL_FILES_URL`.**
+    With it unset (the Compose default), the plugin runtime cannot reach
+    Dify's file URLs, and `dify_extractor` returns "Failed to read file … Check
+    that Dify's FILES_URL is reachable from the plugin runtime" as its text —
+    which is then chunked and indexed as the document, with status
+    `completed`. The local instance sets `INTERNAL_FILES_URL=http://api:5001`
+    in `../dify-oss/docker/.env`.
+  - **Keyword search keeps case.** An economy base's keyword table holds
+    words as the text spells them, so "refunds" finds nothing in a chunk that
+    says "Refunds" (1.17.1). Search with a word spelled the way the chunk
+    spells it.
   - **An `economy` base is always searched by keyword.** `dataset_retrieval`
     overrides `search_method` when the indexing technique is economy, because
     there are no embeddings to compare against. The setting is still stored,

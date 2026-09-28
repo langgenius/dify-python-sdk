@@ -94,10 +94,10 @@ a newer Dify adds still reaches the caller.
   read `output` from a variable aggregator between the two. Run on Dify with
   both plugins installed, the pipeline indexed one chunk reading
   `tool.output` and reported success. It reads the extractor's `text` now, and
-  a live test runs a file through the whole chain and checks what was
-  indexed. (On a Dify whose `INTERNAL_FILES_URL` is unset, the extractor
-  cannot fetch the upload and says so in its text; the test skips there,
-  naming the setting.)
+  a live test runs a file through the whole chain — upload, extract, chunk,
+  index, search — and finds the document's text. (On a Dify whose
+  `INTERNAL_FILES_URL` is unset, the extractor cannot fetch the upload and
+  says so in its text; the test skips there, naming the setting.)
 
 **Four from a sixth review.**
 
@@ -721,6 +721,8 @@ answer node in a pipeline used to build and validate cleanly.
   deliberately — see `probe()`. What that leaves open is history: this SDK is
   verified against Dify 1.17.1, DSL 0.7.0 and graphon 0.8.0, and nothing yet
   records how far back it works.
-- Indexing *through* a pipeline needs a chunker plugin — the knowledge-index
-  node takes structured chunks, not text — and this SDK cannot install one.
-  Build the chain with `wf.tool(...)` once the plugin is in the workspace.
+- Indexing *through* a pipeline needs two marketplace plugins —
+  `langgenius/dify_extractor` and `langgenius/general_chunker` — and this SDK
+  cannot install them. With them installed, `file_pipeline()` indexes a file
+  end to end; the plugin runtime also needs Dify's `INTERNAL_FILES_URL` set to
+  fetch the upload.

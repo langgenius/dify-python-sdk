@@ -303,7 +303,10 @@ class TestAFileGoesAllTheWayIn:
                     "INTERNAL_FILES_URL (e.g. http://api:5001) and restart it"
                 )
 
-            hits = knowledge.datasets.search(result.dataset_id, "refunds")
+            # Keyword search keeps case: "refunds" finds nothing in a chunk
+            # that says "Refunds". A word the chunk spells the same way is
+            # what makes this about the chain rather than about case.
+            hits = knowledge.datasets.search(result.dataset_id, "business days")
             assert any("five business days" in hit.segment.content for hit in hits)
         finally:
             management.pipelines.delete(result)
