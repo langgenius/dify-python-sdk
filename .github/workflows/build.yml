@@ -18,7 +18,7 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
-        python-version: "3.11"
+        python-version: "3.12"
 
     - name: Install uv
       uses: astral-sh/setup-uv@v3
@@ -28,11 +28,20 @@ jobs:
 
     - name: Install build dependencies
       run: |
-        uv sync --dev
+        uv sync --dev --extra workflow
+
+    - name: Run the tests that do not need a server
+      # A release tag does not run ci.yml, so without this the package could
+      # be published without anything having been run against it.
+      run: |
+        uv run pytest -q -m "not live"
 
     - name: Build package
+      # `uv build`, not `uv run build`: the `build` package installs a script
+      # called `pyproject-build`, so `uv run build` fails to spawn — which it
+      # did, on every release.
       run: |
-        uv run build
+        uv build
 
     - name: Check package
       run: |
@@ -50,7 +59,7 @@ jobs:
     needs: build
     strategy:
       matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.14"]
+        python-version: ["3.12", "3.13"]
 
     steps:
     - uses: actions/checkout@v4
@@ -71,15 +80,52 @@ jobs:
         python -m pip install --upgrade pip
         pip install dist/*.whl
 
-    - name: Test import
+    - name: Test import, with no optional dependencies
+      # The Service-API client must import without `graphon`, which only the
+      # `workflow` extra installs.
       run: |
-        python -c "import dify_client; print('Package imported successfully')"
+        python -c "
+        import dify_client
+        missing = [n for n in dify_client.__all__ if not hasattr(dify_client, n)]
+        assert not missing, missing
+        print(f'imported {dify_client.__version__} with {len(dify_client.__all__)} names')
+        "
+
+    - name: Test import with the workflow extra
+      run: |
+        pip install "$(echo dist/*.whl)[workflow]"
+        python -c "
+        from dify_client.workflow import Workflow
+        print('workflow extra ok')
+        "
 
   publish:
     name: Publish to PyPI
     runs-on: ubuntu-latest
     needs: [build, test-install]
     if: github.event_name == 'release' && github.event.action == 'published'
+
+    # A named environment is where the approval lives: with "required
+    # reviewers" set on it in the repository settings, a release cannot reach
+    # PyPI until a human says so, and the run waits rather than uploading.
+    environment:
+      name: pypi
+      url: https://pypi.org/p/dify-client
+
+    permissions:
+      # Trusted publishing: GitHub mints a short-lived OIDC token for this one
+      # run, and PyPI checks it came from this repository, this workflow and
+      # this environment. There is no long-lived API token to store, leak or
+      # rotate — which is why `secrets.PYPI_API_TOKEN` is no longer read here.
+      #
+      # ONE-TIME SETUP on PyPI, under the project's Publishing settings:
+      #   owner       langgenius
+      #   repository  dify-python-sdk
+      #   workflow    build.yml
+      #   environment pypi
+      # Until that exists, this job fails at the upload with "invalid-publisher"
+      # and nothing is published.
+      id-token: write
 
     steps:
     - name: Download build artifacts
@@ -90,5 +136,3 @@ jobs:
 
     - name: Publish to PyPI
       uses: pypa/gh-action-pypi-publish@release/v1
-      with:
-        password: ${{ secrets.PYPI_API_TOKEN }}

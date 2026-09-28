@@ -29,12 +29,13 @@ jobs:
 
     - name: Update dependencies
       run: |
-        uv sync --dev
+        uv sync --dev --extra workflow
         uv pip list --outdated
 
     - name: Run tests after update
+      # The live tests skip themselves without a server; this job has none.
       run: |
-        uv run pytest -v
+        uv run pytest -v -m "not live"
 
     - name: Create Pull Request
       uses: peter-evans/create-pull-request@v5
